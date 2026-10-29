@@ -254,6 +254,78 @@ export default Plugin.define({
       initial: { ids: [] as string[], index: -1, query: "" },
     })
 
+    // ---- editor lock while scroll mode is on -------------------------------
+    // Scroll mode owns the keyboard: the composer must not receive text, or
+    // stray keys would be typed into the prompt while the user navigates.
+    //
+    // Two layers of protection:
+    //   1. Blur the focused renderable (normally the composer) on entry and
+    //      restore it on exit, so it stops accepting input and shows unfocused.
+    //   2. A global keypress guard calls preventDefault() for every key while
+    //      scroll mode is active. Global keymap listeners still run, so the
+    //      scroll bindings keep working; only renderable handlers (the
+    //      composer) are skipped.
+    // If another widget takes focus (dialogs such as search, selects, or the
+    // host's own prompts), the guard steps aside so that widget still receives
+    // input.
+    const renderer: any = context.renderer
+    let savedFocus: any = null
+    let detachGuard: (() => void) | undefined
+
+    const focusedRenderable = (): any => {
+      try {
+        return renderer?.currentFocusedRenderable ?? null
+      } catch {
+        return null
+      }
+    }
+
+    const enterScroll = () => {
+      const target = focusedRenderable()
+      savedFocus = target
+      try {
+        if (target && typeof target.blur === "function") target.blur()
+        else if (target && typeof renderer?.blurRenderable === "function") renderer.blurRenderable(target)
+      } catch {
+        /* ignore */
+      }
+      try {
+        renderer?.requestRender?.()
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const exitScroll = () => {
+      const target = savedFocus
+      savedFocus = null
+      try {
+        if (target && !target.isDestroyed) {
+          if (typeof target.focus === "function") target.focus()
+          else if (typeof renderer?.focusRenderable === "function") renderer.focusRenderable(target)
+        }
+      } catch {
+        /* ignore */
+      }
+      try {
+        renderer?.requestRender?.()
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const onKey = (key: any) => {
+      if (!state.active) return
+      const focused = focusedRenderable()
+      // A dialog or other widget has taken focus: let it receive input.
+      if (focused && focused !== savedFocus) return
+      try {
+        key.preventDefault()
+      } catch {
+        /* ignore */
+      }
+    }
+
     const toast = (message: string, variant?: "info" | "success" | "warning" | "error") => {
       try {
         context.ui.toast.show(variant ? { message, variant } : { message })
@@ -387,15 +459,17 @@ export default Plugin.define({
               draft.active = next
             })
             if (!next) {
-              toast("Edit mode: readline keys restored")
+              exitScroll()
+              toast("Edit mode: editor enabled, readline keys restored")
               return
             }
+            enterScroll()
             if (options.vim) {
               toast(
-                "Scroll mode: j/k line · ctrl+d/u half · ctrl+f/b page · gg/G ends · [ ] user msgs · / ? search · n/N match · q exit",
+                "Scroll mode: editor disabled · j/k line · ctrl+d/u half · ctrl+f/b page · gg/G ends · [ ] user msgs · / ? search · n/N match · q exit",
               )
             } else {
-              toast("Scroll mode: ctrl+u / ctrl+d scroll, ctrl+q back to edit")
+              toast("Scroll mode: editor disabled · ctrl+u / ctrl+d scroll, ctrl+q back to edit")
             }
           },
         },
@@ -487,7 +561,8 @@ export default Plugin.define({
                 setState((draft: any) => {
                   draft.active = false
                 })
-                toast("Edit mode: readline keys restored")
+                exitScroll()
+                toast("Edit mode: editor enabled, readline keys restored")
               },
             },
           )
@@ -535,5 +610,34 @@ export default Plugin.define({
         bindings: commands.map((c) => c.id),
       }
     })
+
+    // Register the guard after the keymap layer so the host's dispatcher runs
+    // first and scroll bindings still fire; the guard only stops the event from
+    // reaching renderables (the composer).
+    try {
+      if (renderer?.keyInput && typeof renderer.keyInput.on === "function") {
+        renderer.keyInput.on("keypress", onKey)
+        detachGuard = () => {
+          try {
+            renderer.keyInput.off("keypress", onKey)
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // If the plugin reloads while scroll mode was on, keep the editor locked.
+    const restoreIfActive = setTimeout(() => {
+      if (state.active) enterScroll()
+    }, 0)
+
+    return () => {
+      clearTimeout(restoreIfActive)
+      detachGuard?.()
+      exitScroll()
+    }
   },
 })
