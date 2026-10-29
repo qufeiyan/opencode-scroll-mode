@@ -1,0 +1,12 @@
+{
+  "name": "opencode-scroll-mode",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  }
+}
