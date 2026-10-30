@@ -19,6 +19,19 @@ import { Plugin } from "@opencode/plugin/tui"
 //   maxResults   number   max search results shown   (default 100)
 //   searchScope  string   "all" | "user"             (default "all")
 
+// Cursor hiding must survive plugin reloads and prompt re-focus/remount.
+// `showCursor` is an EditBufferRenderable option: blur() hides the native
+// cursor, but a re-focused/remounted prompt can turn it back on. Pinning
+// showCursor=false keeps it hidden until scroll mode exits.
+const CURSOR_KEY = Symbol.for("opencode.scroll-mode.cursor")
+type CursorBox = { saved: WeakMap<object, boolean> }
+function cursorBox(): CursorBox {
+  const g = globalThis as unknown as Record<symbol, CursorBox | undefined>
+  let box = g[CURSOR_KEY]
+  if (!box) box = g[CURSOR_KEY] = { saved: new WeakMap() }
+  return box
+}
+
 // Built-in OpenCode commands we delegate to. Keeping the scrolling itself in
 // the host means the transcript viewport stays authoritative and we never
 // fight its pagination logic.
@@ -271,6 +284,7 @@ export default Plugin.define({
     const renderer: any = context.renderer
     let savedFocus: any = null
     let detachGuard: (() => void) | undefined
+    let detachCursorGuard: (() => void) | undefined
 
     const focusedRenderable = (): any => {
       try {
@@ -280,9 +294,40 @@ export default Plugin.define({
       }
     }
 
+    // Hide the editor cursor while scroll mode owns the keyboard. The prompt
+    // may re-focus or remount after setup, so the original value is kept in a
+    // process-wide WeakMap and the focused_editor listener re-applies the lock.
+    const hideEditorCursor = (target: any) => {
+      if (!target) return
+      try {
+        if (typeof target.showCursor === "boolean") {
+          const box = cursorBox()
+          if (!box.saved.has(target)) box.saved.set(target, target.showCursor)
+          target.showCursor = false
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const restoreEditorCursor = (target: any) => {
+      if (!target) return
+      try {
+        const box = cursorBox()
+        const previous = box.saved.get(target)
+        if (previous !== undefined) {
+          box.saved.delete(target)
+          if (!target.isDestroyed) target.showCursor = previous
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
     const enterScroll = () => {
       const target = focusedRenderable()
       savedFocus = target
+      hideEditorCursor(target)
       try {
         if (target && typeof target.blur === "function") target.blur()
         else if (target && typeof renderer?.blurRenderable === "function") renderer.blurRenderable(target)
@@ -299,6 +344,7 @@ export default Plugin.define({
     const exitScroll = () => {
       const target = savedFocus
       savedFocus = null
+      restoreEditorCursor(target)
       try {
         if (target && !target.isDestroyed) {
           if (typeof target.focus === "function") target.focus()
@@ -319,8 +365,24 @@ export default Plugin.define({
       const focused = focusedRenderable()
       // A dialog or other widget has taken focus: let it receive input.
       if (focused && focused !== savedFocus) return
+      if (focused) hideEditorCursor(focused)
       try {
         key.preventDefault()
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // Slot/plugin updates can re-focus or remount the prompt after scroll mode
+    // starts. Keep its cursor hidden, and adopt a remounted input so the
+    // keypress guard above keeps applying to the new instance.
+    const onFocusedEditor = (current: any) => {
+      if (!state.active || !current || current.isDestroyed) return
+      if (savedFocus && savedFocus.isDestroyed) savedFocus = current
+      if (current !== savedFocus) return
+      hideEditorCursor(current)
+      try {
+        renderer?.requestRender?.()
       } catch {
         /* ignore */
       }
@@ -629,6 +691,22 @@ export default Plugin.define({
       /* ignore */
     }
 
+    // Keep the composer's cursor hidden if the host re-focuses or remounts it.
+    try {
+      if (renderer && typeof renderer.on === "function") {
+        renderer.on("focused_editor", onFocusedEditor)
+        detachCursorGuard = () => {
+          try {
+            renderer.off("focused_editor", onFocusedEditor)
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
     // If the plugin reloads while scroll mode was on, keep the editor locked.
     const restoreIfActive = setTimeout(() => {
       if (state.active) enterScroll()
@@ -637,6 +715,7 @@ export default Plugin.define({
     return () => {
       clearTimeout(restoreIfActive)
       detachGuard?.()
+      detachCursorGuard?.()
       exitScroll()
     }
   },
