@@ -61,16 +61,24 @@ type Options = {
   search: boolean
   maxResults: number
   searchScope: "all" | "user"
+  highlight: boolean
+  cursorColor: string
+  selectionColor: string
 }
 
 function readOptions(raw: unknown): Options {
   const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
   const maxRaw = o.maxResults
+  const color = (v: unknown, fallback: string): string =>
+    typeof v === "string" && /^(#|rgb|hsl)/i.test(v.trim()) ? v.trim() : fallback
   return {
     vim: o.vim !== false,
     search: o.search !== false,
     maxResults: typeof maxRaw === "number" && maxRaw > 0 ? Math.floor(maxRaw) : 100,
     searchScope: o.searchScope === "user" ? "user" : "all",
+    highlight: o.highlight !== false,
+    cursorColor: color(o.cursorColor, "#233043"),
+    selectionColor: color(o.selectionColor, "#264f78"),
   }
 }
 
@@ -467,6 +475,8 @@ export default Plugin.define({
       const target = focusedRenderable()
       savedFocus = target
       hideEditorCursor(target)
+      // Cursor bar / selection tint need the viewport refreshed continuously.
+      startPoll()
       try {
         if (target && typeof target.blur === "function") target.blur()
         else if (target && typeof renderer?.blurRenderable === "function") renderer.blurRenderable(target)
@@ -481,6 +491,8 @@ export default Plugin.define({
     }
 
     const exitScroll = () => {
+      stopPoll()
+      restoreAllHighlights()
       const target = savedFocus
       savedFocus = null
       restoreEditorCursor(target)
@@ -622,7 +634,7 @@ export default Plugin.define({
       } else {
         toast(`Match ${idx + 1}/${shown.length} is outside the loaded view — scroll up to load it, then press n`, "warning")
       }
-      setTimeout(refreshVisualMark, 150)
+      setTimeout(refreshViewport, 150)
     }
 
     const stepSearch = (delta: number) => {
@@ -643,7 +655,7 @@ export default Plugin.define({
       } else {
         toast(`Match ${i + 1}/${ids.length} is outside the loaded view — scroll up to load it`, "warning")
       }
-      setTimeout(refreshVisualMark, 150)
+      setTimeout(refreshViewport, 150)
     }
 
     // ---- visual mode ---------------------------------------------------------
@@ -684,34 +696,119 @@ export default Plugin.define({
       return null
     }
 
-    const refreshVisualMark = () => {
-      if (!visual.active) return
+    // ---- poll: visual mark + highlight overlay -------------------------------
+    // One 150ms poll drives everything that needs the viewport: the visual
+    // mark follows the top visible message, and message boxes get a background
+    // tint — a cursor bar in scroll mode, the whole range in visual mode.
+    // Host renderables are not public API, so every write is guarded and the
+    // original color is restored on exit.
+    let pollTimer: ReturnType<typeof setInterval> | undefined
+    const stopPoll = () => {
+      if (pollTimer) {
+        clearInterval(pollTimer)
+        pollTimer = undefined
+      }
+    }
+
+    const savedBg = new WeakMap<object, any>()
+    const applied = new Map<RNode, string>()
+    let highlightUnsupported = false
+
+    const restoreNode = (node: RNode) => {
+      try {
+        if ((node as any).isDestroyed) return
+        ;(node as any).backgroundColor = savedBg.get(node)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const restoreAllHighlights = () => {
+      for (const node of applied.keys()) restoreNode(node)
+      applied.clear()
+    }
+
+    const applyColor = (node: RNode, color: string) => {
+      try {
+        if (!("backgroundColor" in (node as any))) {
+          if (!highlightUnsupported) {
+            highlightUnsupported = true
+            toast("This OpenCode build does not expose message styles — no highlight", "warning")
+          }
+          return
+        }
+        if (!savedBg.has(node)) savedBg.set(node, (node as any).backgroundColor)
+        ;(node as any).backgroundColor = color
+        applied.set(node, color)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const idxInList = (msgs: any[], id: string | null): number =>
+      id ? msgs.findIndex((m) => messageId(m) === id) : -1
+
+    const refreshViewport = () => {
+      // A deferred refresh can land after scroll mode turned off; never paint
+      // a highlight outside scroll mode.
+      if (!state.active) {
+        restoreAllHighlights()
+        return
+      }
       const sid = currentSession()
       if (!sid) return
       const msgs = listMessages(sid)
       const box = ensureVisualBox(msgs)
       if (!box) {
         visualBox = null
+        restoreAllHighlights()
         return
       }
       const top = visibleTopMessageId(context, box, msgs, resolveNodeCached)
-      if (!top || top === visual.markId) return
-      setVisual((draft: any) => {
-        draft.markId = top
-      })
-    }
-
-    let visualTimer: ReturnType<typeof setInterval> | undefined
-    const stopVisualPoll = () => {
-      if (visualTimer) {
-        clearInterval(visualTimer)
-        visualTimer = undefined
+      if (!top) return
+      // The visual mark follows the viewport; anchor stays put.
+      if (visual.active && top !== visual.markId) {
+        setVisual((draft: any) => {
+          draft.markId = top
+        })
+      }
+      if (!options.highlight) return
+      const want = new Map<RNode, string>()
+      const add = (id: string | null, color: string) => {
+        if (!id) return
+        const node = resolveNodeCached(id)
+        if (node) want.set(node, color)
+      }
+      if (visual.active) {
+        const a = idxInList(msgs, visual.anchorId)
+        const b = idxInList(msgs, top)
+        if (a >= 0 && b >= 0) {
+          const lo = Math.min(a, b)
+          const hi = Math.max(a, b)
+          for (let i = lo; i <= hi; i++) add(messageId(msgs[i]), options.selectionColor)
+        } else {
+          add(top, options.selectionColor)
+        }
+        // Keep the moving end slightly distinct so the cursor stays readable.
+        add(top, options.cursorColor)
+      } else {
+        add(top, options.cursorColor)
+      }
+      for (const node of Array.from(applied.keys())) {
+        if (!want.has(node)) {
+          restoreNode(node)
+          applied.delete(node)
+        }
+      }
+      for (const [node, color] of want) {
+        if (applied.get(node) !== color) applyColor(node, color)
       }
     }
-    const startVisualPoll = () => {
-      stopVisualPoll()
-      refreshVisualMark()
-      visualTimer = setInterval(refreshVisualMark, 150)
+
+    const startPoll = () => {
+      stopPoll()
+      refreshViewport()
+      pollTimer = setInterval(refreshViewport, 150)
     }
 
     const enterVisual = (linewise: boolean) => {
@@ -733,19 +830,21 @@ export default Plugin.define({
         draft.anchorId = top
         draft.markId = top
       })
-      startVisualPoll()
+      refreshViewport()
+      const pos = idxInList(msgs, top) + 1
       toast(
-        `${linewise ? "V" : "v"} visual: anchored at ${clip(messageText(msgs.find((m) => messageId(m) === top) as any), 36) || "message"} — j/k/… move · o swap · y yank · esc cancel`,
+        `${linewise ? "V" : "v"} visual: msg ${pos}/${msgs.length} — j/k/… move · o swap · y yank · esc cancel`,
       )
     }
 
     const exitVisual = () => {
-      stopVisualPoll()
       setVisual((draft: any) => {
         draft.active = false
         draft.anchorId = null
         draft.markId = null
       })
+      // Selection tint goes away; the cursor bar returns on the next refresh.
+      refreshViewport()
     }
 
     const yankVisual = async () => {
@@ -789,7 +888,7 @@ export default Plugin.define({
     // the visual mark then. Cheap no-op while visual mode is off.
     const afterScroll = (fn: () => void) => () => {
       fn()
-      setTimeout(refreshVisualMark, 120)
+      setTimeout(refreshViewport, 120)
     }
 
     // Diagnostic dump: records what the renderer tree actually exposes at
@@ -1154,15 +1253,13 @@ export default Plugin.define({
     }
 
     // If the plugin reloads while scroll mode was on, keep the editor locked
-    // (and the visual poll running if a selection was active).
+    // and the highlight poll running (enterScroll starts it).
     const restoreIfActive = setTimeout(() => {
       if (state.active) enterScroll()
-      if (visual.active) startVisualPoll()
     }, 0)
 
     return () => {
       clearTimeout(restoreIfActive)
-      stopVisualPoll()
       detachGuard?.()
       detachCursorGuard?.()
       exitScroll()

@@ -40,6 +40,12 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 
 复制通道：优先 **OSC52**（iTerm2 需在设置里允许终端访问剪贴板；tmux 需 `set -g set-clipboard on`；ssh 远端也可能直接生效），失败时回退 `pbcopy`（macOS）/ `wl-copy` / `xclip`（Linux）。
 
+### 视觉反馈（光标条 + 选区着色）
+
+滚动模式下，**视口顶部那条消息会被着色**，作为「光标」位置提示；进入 visual 后，锚点到游标之间的所有消息整体着色，游标端颜色略深。退出滚动模式时恢复宿主原始配色。
+
+实现方式：给消息节点写 `backgroundColor`（宿主 renderable 不属于公开 API，写失败会自动降级为 toast 提示并关闭高亮）。可用 `highlight: false` 完全关闭，或用 `cursorColor` / `selectionColor` 自定义颜色。
+
 ## 搜索
 
 `/` 输入关键词 → 在会话消息中全文检索 → 结果列表（摘要 + 角色 + 时间）→ 选中跳转；`n` / `N` 在结果间循环。
@@ -72,6 +78,9 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 | `search` | boolean | `true` | 是否启用消息搜索 |
 | `maxResults` | number | `100` | 搜索结果上限 |
 | `searchScope` | `"all"` \| `"user"` | `"all"` | 搜索范围 |
+| `highlight` | boolean | `true` | 光标条 / 选区着色覆盖 |
+| `cursorColor` | string | `"#233043"` | 光标条背景色（hex / rgb） |
+| `selectionColor` | string | `"#264f78"` | visual 选区背景色 |
 
 > 提示：同一目录若既位于自动加载的 `plugins/` 下、又在 `plugins` 中显式列出，可能被加载两次。二选一。
 
