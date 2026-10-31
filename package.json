@@ -1,10 +1,31 @@
 {
   "name": "opencode-scroll-mode",
   "version": "0.1.0",
+  "description": "OpenCode TUI scroll mode plugin — toggle edit/scroll states with vim keys and message search",
   "type": "module",
   "exports": {
     ".": "./index.ts",
     "./tui": "./tui.ts"
+  },
+  "files": [
+    "index.ts",
+    "tui.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tui",
+    "scroll",
+    "vim"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qufeiyan/opencode-scroll-mode.git"
+  },
+  "homepage": "https://github.com/qufeiyan/opencode-scroll-mode#readme",
+  "bugs": {
+    "url": "https://github.com/qufeiyan/opencode-scroll-mode/issues"
   },
   "dependencies": {
     "@opencode/plugin": "latest"
