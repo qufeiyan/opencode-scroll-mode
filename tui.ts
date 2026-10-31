@@ -292,7 +292,12 @@ function offsetWithin(box: RNode, node: RNode): number | null {
   return null
 }
 
-function visibleTopMessageId(context: any, box: RNode, msgs: any[]): string | null {
+function visibleTopMessageId(
+  context: any,
+  box: RNode,
+  msgs: any[],
+  resolve?: (id: string) => RNode | null,
+): string | null {
   const scrollTop = typeof (box as any).scrollTop === "number" ? (box as any).scrollTop : 0
   const boxH =
     typeof (box as any).height === "number" && (box as any).height > 0
@@ -300,16 +305,31 @@ function visibleTopMessageId(context: any, box: RNode, msgs: any[]): string | nu
       : typeof (box as any).viewport?.height === "number"
         ? (box as any).viewport.height
         : 40
+  const find = resolve ?? ((id: string) => messageNode(context, id))
+  type Cand = { id: string; y: number; h: number }
+  const nodes: Cand[] = []
   for (const m of msgs) {
     const id = messageId(m)
     if (!id) continue
-    const node = messageNode(context, id)
+    const node = find(id)
     if (!node) continue
-    const off = offsetWithin(box, node)
-    if (off === null) continue
-    const nodeH = typeof node.height === "number" ? (node.height as number) : 1
-    // Top edge inside the viewport (tolerance), or spanning the top edge.
-    if (off + nodeH > scrollTop + 1 && off < scrollTop + boxH - 1) return id
+    const vy = (node as any).y
+    if (typeof vy !== "number") continue
+    const h = typeof node.height === "number" ? (node.height as number) : 1
+    nodes.push({ id, y: vy, h })
+  }
+  if (nodes.length === 0) return null
+  // Verified against the live TUI: node.y is the PAINTED viewport coordinate,
+  // i.e. content y minus scrollTop (a partially visible message at the top
+  // edge has a negative y). List order is display order, so the first node
+  // that intrudes into [0, boxH) is the topmost visible message.
+  for (const n of nodes) {
+    if (n.y + n.h > 0.5 && n.y < boxH - 0.5) return n.id
+  }
+  // Fallback for a coordinate space that does not pre-apply the scroll offset
+  // (raw content coordinates): same test with scrollTop added back.
+  for (const n of nodes) {
+    if (n.y + n.h > scrollTop + 0.5 && n.y < scrollTop + boxH - 0.5) return n.id
   }
   return null
 }
@@ -632,6 +652,21 @@ export default Plugin.define({
 
     let visualBox: RNode | undefined | null // undefined = unknown, null = lookup failed
 
+    // id -> renderer node. findDescendantById is a tree search, and a session
+    // can hold 150+ rendered messages; caching keeps the 150ms visual poll
+    // cheap. Entries are dropped when the host destroys a node.
+    const nodeCache = new Map<string, RNode>()
+    const resolveNodeCached = (id: string): RNode | null => {
+      const hit = nodeCache.get(id)
+      if (hit) {
+        if ((hit as any).isDestroyed) nodeCache.delete(id)
+        else return hit
+      }
+      const node = messageNode(context, id)
+      if (node) nodeCache.set(id, node)
+      return node
+    }
+
     const ensureVisualBox = (msgs: any[]): RNode | null => {
       if (visualBox) return visualBox
       if (visualBox === null) return null
@@ -659,7 +694,7 @@ export default Plugin.define({
         visualBox = null
         return
       }
-      const top = visibleTopMessageId(context, box, msgs)
+      const top = visibleTopMessageId(context, box, msgs, resolveNodeCached)
       if (!top || top === visual.markId) return
       setVisual((draft: any) => {
         draft.markId = top
@@ -687,7 +722,7 @@ export default Plugin.define({
       }
       const msgs = listMessages(sid)
       const box = ensureVisualBox(msgs)
-      const top = box ? visibleTopMessageId(context, box, msgs) : null
+      const top = box ? visibleTopMessageId(context, box, msgs, resolveNodeCached) : null
       if (!top) {
         toast("No message rendered in view — jump with [ ] or / first, then press v", "warning")
         return
@@ -727,7 +762,7 @@ export default Plugin.define({
       } else {
         // Normal-mode y: yank the message currently at the top of the viewport.
         const box = ensureVisualBox(msgs)
-        const top = box ? visibleTopMessageId(context, box, msgs) : null
+        const top = box ? visibleTopMessageId(context, box, msgs, resolveNodeCached) : null
         a = idxOf(top)
         b = a
       }
@@ -755,6 +790,90 @@ export default Plugin.define({
     const afterScroll = (fn: () => void) => () => {
       fn()
       setTimeout(refreshVisualMark, 120)
+    }
+
+    // Diagnostic dump: records what the renderer tree actually exposes at
+    // runtime (node ids, y-values, scroll box fields) so viewport math can be
+    // validated against the real TUI. Output lands in /tmp/scroll-mode-diag.json.
+    const dumpViewportDiagnostics = () => {
+      void (async () => {
+        const diag: Record<string, unknown> = { ts: new Date().toISOString() }
+        try {
+          const sid = currentSession()
+          diag.session = sid
+          const msgs = sid ? listMessages(sid) : []
+          diag.messageCount = msgs.length
+          const ids = msgs.map((m: any) => messageId(m)).filter(Boolean)
+          diag.firstId = ids[0] ?? null
+          diag.lastId = ids[ids.length - 1] ?? null
+          const root: any = renderer?.root
+          diag.rootType = root ? String(root.constructor?.name) : null
+          diag.hasFindDescendantById = !!root && typeof root.findDescendantById === "function"
+          const checked: unknown[] = []
+          for (let i = Math.max(0, ids.length - 10); i < ids.length; i++) {
+            const id = ids[i]
+            const node = messageNode(context, id)
+            const entry: Record<string, unknown> = {
+              id: id ? String(id).slice(-10) : null,
+              node: !!node,
+              yType: node ? typeof (node as any).y : null,
+              y: node ? (typeof (node as any).y === "number" ? (node as any).y : String((node as any).y)) : null,
+              heightType: node ? typeof (node as any).height : null,
+            }
+            if (node) {
+              let cur: any = node.parent
+              let hops = 0
+              const chain: string[] = []
+              while (cur && typeof cur === "object" && hops < 14) {
+                chain.push(String(cur.id ?? cur.constructor?.name).slice(0, 24))
+                cur = cur.parent
+                hops++
+              }
+              entry.parentHops = hops
+              entry.chain = chain.slice(0, 8).join(" <- ")
+              const box = findScrollBoxAncestor(node)
+              entry.boxType = box ? String((box as any).constructor?.name) : null
+              if (box) {
+                const off = offsetWithin(box, node)
+                entry.offsetWithin = off
+                entry.offsetTopBox = typeof (box as any).y === "number" ? (box as any).y : null
+                entry.boxId = String(box.id ?? "")
+                if (offsetWithin(box, node) !== null && entry.boxSample !== true) {
+                  entry.boxSample = true
+                  diag.boxSample = {
+                    scrollTop: typeof (box as any).scrollTop === "number" ? (box as any).scrollTop : String((box as any).scrollTop),
+                    height: typeof (box as any).height === "number" ? (box as any).height : String((box as any).height),
+                    scrollHeight: typeof (box as any).scrollHeight === "number" ? (box as any).scrollHeight : String((box as any).scrollHeight),
+                    viewportHeight: typeof (box as any).viewport?.height === "number" ? (box as any).viewport.height : String((box as any).viewport?.height),
+                    contentHeight: typeof (box as any).content?.height === "number" ? (box as any).content.height : String((box as any).content?.height),
+                    screenY: typeof (box as any)._screenY === "number" ? (box as any)._screenY : String((box as any)._screenY),
+                    scrollState: (() => {
+                      try {
+                        const st = (box as any)._scrollState?.()
+                        return st ? { y: st.y, height: st.height, contentHeight: st.contentHeight } : null
+                      } catch {
+                        return null
+                      }
+                    })(),
+                  }
+                }
+              }
+            }
+            checked.push(entry)
+          }
+          diag.checked = checked
+          diag.visibleTopResult = visibleTopMessageId(context, ensureVisualBox(msgs) ?? ({ id: "no-box" } as RNode), msgs, resolveNodeCached)
+        } catch (e: any) {
+          diag.error = String(e?.stack ?? e)
+        }
+        try {
+          const fs = await import("node:fs")
+          fs.appendFileSync("/tmp/scroll-mode-diag.json", JSON.stringify(diag, null, 1) + "\n---\n")
+        } catch (e2: any) {
+          diag.writeError = String(e2)
+        }
+        toast("Diagnostics → /tmp/scroll-mode-diag.json")
+      })()
     }
 
     keymap.layer(() => {
@@ -916,6 +1035,13 @@ export default Plugin.define({
                 exitScroll()
                 toast("Edit mode: editor enabled, readline keys restored")
               },
+            },
+            {
+              id: "scroll-mode.debug",
+              title: "Dump viewport diagnostics",
+              group: "Scroll mode",
+              palette: true,
+              run: () => dumpViewportDiagnostics(),
             },
           )
 
