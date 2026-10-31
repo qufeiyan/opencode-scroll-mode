@@ -64,6 +64,7 @@ type Options = {
   highlight: boolean
   cursorColor: string
   selectionColor: string
+  barColor: string
 }
 
 function readOptions(raw: unknown): Options {
@@ -78,6 +79,7 @@ function readOptions(raw: unknown): Options {
     cursorColor: typeof o.cursorColor === "string" && o.cursorColor ? o.cursorColor : "#3d5a80",
     selectionColor:
       typeof o.selectionColor === "string" && o.selectionColor ? o.selectionColor : "#2f5d9e",
+    barColor: typeof o.barColor === "string" && o.barColor ? o.barColor : "#7aa2f7",
   }
 }
 
@@ -1035,6 +1037,60 @@ export default Plugin.define({
       applyHighlight()
     }
 
+    // ---- left gutter bar ----------------------------------------------------
+    // The host's selection may not be visible in every build. This 1-cell bar
+    // is painted straight into the frame in the renderer's post-process pass,
+    // so the current line always has a marker on its left edge, on top of
+    // whatever the transcript drew.
+    let barRgba: any = null
+    let barPos: { x: number; y: number } | null = null
+    let barStamp = 0
+
+    const colorFrom = (probe: any, hex: string): any => {
+      try {
+        const Ctor = probe?.backgroundColor?.constructor
+        return Ctor?.fromHex?.(hex) ?? null
+      } catch {
+        return null
+      }
+    }
+
+    const refreshBar = (force = false) => {
+      const now = Date.now()
+      if (!force && now - barStamp < 30) return
+      barStamp = now
+      barPos = null
+      if (!state.active) return
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      if (!box) return
+      const hit = topLineHit(msgs, boxTopOf(box))
+      if (!hit) return
+      if (!barRgba) barRgba = colorFrom(box, options.barColor)
+      // One cell left of the text is the message gutter; clamp at the edge.
+      barPos = { x: Math.max(0, nodeX(hit.node) - 1), y: hit.screenY }
+    }
+
+    const drawCursorBar = (buffer: any) => {
+      try {
+        if (!state.active || !options.highlight) return
+        refreshBar()
+        if (!barPos || !barRgba) return
+        if (barPos.y < 0) return
+        buffer.fillRect(barPos.x, barPos.y, 1, 1, barRgba)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    try {
+      renderer?.addPostProcessFn?.(drawCursorBar)
+    } catch {
+      /* ignore */
+    }
+
     const startPoll = () => {
       stopPoll()
       applyHighlight()
@@ -1610,6 +1666,11 @@ export default Plugin.define({
       clearTimeout(restoreIfActive)
       detachGuard?.()
       detachCursorGuard?.()
+      try {
+        renderer?.removePostProcessFn?.(drawCursorBar)
+      } catch {
+        /* ignore */
+      }
       exitScroll()
     }
   },

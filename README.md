@@ -42,9 +42,11 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 
 复制通道：优先 **OSC52**（iTerm2 需在设置里允许终端访问剪贴板；tmux 需 `set -g set-clipboard on`；ssh 远端也可能直接生效），失败时回退 `pbcopy`（macOS）/ `wl-copy` / `xclip`（Linux）。
 
-### 视觉反馈（行光标 + 选区）
+### 视觉反馈（左侧竖线光标 + 选区）
 
-滚动模式下，**视口顶部的第一行**整行着色，作为「行光标」；按 `v` 后锚点行到当前行之间高亮，`h`/`l` 在当前行左右扩展，`V` 则按整行选中。退出滚动模式或取消 visual 时立即清除并恢复宿主原色。
+滚动模式下，**当前行左侧会画一条竖线光标**（布局在消息文字左边的空白处），让你随时知道自己在哪一行；同时视口顶部的第一行整行淡着色。按 `v` 后锚点行到当前行之间高亮，`h`/`l` 在当前行左右扩展，`V` 则按整行选中。退出滚动模式或取消 visual 时立即清除并恢复宿主原色。
+
+竖线光标不经过宿主选区系统，而是挂在 `renderer.addPostProcessFn` 上直接写帧缓冲，所以即使宿主版本不渲染选区也一定可见（颜色由 `barColor` 控制）。
 
 实现方式：调用宿主的选区 API（`renderer.startSelection` / `updateSelection` / `clearSelection`），与鼠标拖选走同一套渲染路径，按真实文本行对齐。由于宿主默认不给文本节点设置 `selectionBg`，插件会显式设置 `cursorColor` / `selectionColor`（退出时还原），否则选区可能完全看不见。宿主 renderable 不属于公开 API，调用失败会降级为 toast 提示；可用 `highlight: false` 完全关闭。
 
@@ -70,7 +72,8 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
         "searchScope": "all",
         "highlight": true,
         "cursorColor": "#3d5a80",
-        "selectionColor": "#2f5d9e"
+        "selectionColor": "#2f5d9e",
+        "barColor": "#7aa2f7"
       }
     }
   ]
@@ -86,6 +89,7 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 | `highlight` | boolean | `true` | 行光标 / 选区高亮 |
 | `cursorColor` | string | `"#3d5a80"` | 行光标背景色 |
 | `selectionColor` | string | `"#2f5d9e"` | visual 选区背景色 |
+| `barColor` | string | `"#7aa2f7"` | 左侧竖线光标颜色 |
 
 > 提示：同一目录若既位于自动加载的 `plugins/` 下、又在 `plugins` 中显式列出，可能被加载两次。二选一。
 
