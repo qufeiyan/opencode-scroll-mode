@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process"
 import { Plugin } from "@opencode/plugin/tui"
 
 // Conversation scroll mode for the OpenCode TUI.
@@ -18,6 +19,13 @@ import { Plugin } from "@opencode/plugin/tui"
 //   search       boolean  enable message search      (default true)
 //   maxResults   number   max search results shown   (default 100)
 //   searchScope  string   "all" | "user"             (default "all")
+//
+// Visual mode (message granularity): v / V anchor on the message currently at
+// the top of the transcript viewport; navigation keys keep the other end
+// (mark) following the viewport; y copies the selected messages' plain text
+// to the system clipboard (OSC52, with pbcopy/xclip/wl-copy as fallback).
+// The host owns transcript rendering, so a true on-screen highlight is out of
+// reach for now — toasts announce anchor/range instead.
 
 // Cursor hiding must survive plugin reloads and prompt re-focus/remount.
 // `showCursor` is an EditBufferRenderable option: blur() hides the native
@@ -250,7 +258,108 @@ function jumpToMessage(ctx: any, id: string): boolean {
   return false
 }
 
-// ---- plugin ---------------------------------------------------------------
+// ---- visual mode helpers ---------------------------------------------------
+// Selection granularity is the whole message: the transcript is rendered by
+// the host, so there is no text-level caret to anchor a sub-message range.
+// The anchor/mark are message ids; order comes from the session message list.
+
+function messageNode(context: any, id: string): RNode | null {
+  try {
+    const root = context.renderer?.root as RNode | undefined
+    if (!root || typeof root.findDescendantById !== "function") return null
+    const node = (root.findDescendantById as any).call(root, id) as RNode | null
+    return node && typeof node === "object" ? node : null
+  } catch {
+    return null
+  }
+}
+
+// Vertical offset of a node inside its ScrollBox: sum the relative layout `y`
+// walking from the node up to the box. Returns null when the chain breaks or
+// the node does not live inside this box.
+function offsetWithin(box: RNode, node: RNode): number | null {
+  let y = 0
+  let cur: any = node
+  let hops = 0
+  while (cur && typeof cur === "object" && hops < 64) {
+    if (cur === box) return y
+    const vy = (cur as RNode).y
+    if (typeof vy !== "number") return null
+    y += vy as number
+    cur = (cur as RNode).parent ?? null
+    hops++
+  }
+  return null
+}
+
+function visibleTopMessageId(context: any, box: RNode, msgs: any[]): string | null {
+  const scrollTop = typeof (box as any).scrollTop === "number" ? (box as any).scrollTop : 0
+  const boxH =
+    typeof (box as any).height === "number" && (box as any).height > 0
+      ? (box as any).height
+      : typeof (box as any).viewport?.height === "number"
+        ? (box as any).viewport.height
+        : 40
+  for (const m of msgs) {
+    const id = messageId(m)
+    if (!id) continue
+    const node = messageNode(context, id)
+    if (!node) continue
+    const off = offsetWithin(box, node)
+    if (off === null) continue
+    const nodeH = typeof node.height === "number" ? (node.height as number) : 1
+    // Top edge inside the viewport (tolerance), or spanning the top edge.
+    if (off + nodeH > scrollTop + 1 && off < scrollTop + boxH - 1) return id
+  }
+  return null
+}
+
+function rangeText(msgs: any[], aIdx: number, bIdx: number, linewise: boolean): string {
+  const s = Math.min(aIdx, bIdx)
+  const e = Math.max(aIdx, bIdx)
+  const texts: string[] = []
+  for (let i = s; i <= e && i < msgs.length; i++) {
+    const t = messageText(msgs[i])
+    if (t.trim()) texts.push(t)
+  }
+  return texts.join(linewise ? "\n" : "\n\n")
+}
+
+// OSC52 first (works over ssh when the terminal allows it), then a native
+// helper binary as fallback (pbcopy on macOS, wl-copy/xclip on Linux).
+async function copyToSystemClipboard(context: any, text: string): Promise<boolean> {
+  try {
+    if (context.renderer?.copyToClipboardOSC52?.(text)) return true
+  } catch {
+    /* fall through */
+  }
+  try {
+    const targets: Array<{ cmd: string; args: string[] }> = []
+    if (process.platform === "darwin") targets.push({ cmd: "pbcopy", args: [] })
+    if (process.platform === "linux") {
+      targets.push({ cmd: "wl-copy", args: [] })
+      targets.push({ cmd: "xclip", args: ["-selection", "clipboard"] })
+    }
+    for (const t of targets) {
+      const ok = await new Promise<boolean>((resolve) => {
+        try {
+          const child = spawn(t.cmd, t.args, { stdio: ["pipe", "ignore", "ignore"] })
+          child.on("error", () => resolve(false))
+          child.stdin.on("error", () => resolve(false))
+          child.stdin.end(text, () => resolve(true))
+        } catch {
+          resolve(false)
+        }
+      })
+      if (ok) return true
+    }
+  } catch {
+    /* ignore */
+  }
+  return false
+}
+
+// ---- plugin -----------------------------------------------------------------
 
 export default Plugin.define({
   id: "scroll-mode.tui",
@@ -265,6 +374,16 @@ export default Plugin.define({
     // index is the current match (-1 before the first jump).
     const [search, setSearch] = context.storage.memory("scroll-mode.search", {
       initial: { ids: [] as string[], index: -1, query: "" },
+    })
+    // Visual selection: anchor/mark are message ids in the transcript.
+    // Mark follows the viewport so navigation keys grow the selection.
+    const [visual, setVisual] = context.storage.memory("scroll-mode.visual", {
+      initial: {
+        active: false,
+        linewise: false,
+        anchorId: null as string | null,
+        markId: null as string | null,
+      },
     })
 
     // ---- editor lock while scroll mode is on -------------------------------
@@ -483,6 +602,7 @@ export default Plugin.define({
       } else {
         toast(`Match ${idx + 1}/${shown.length} is outside the loaded view — scroll up to load it, then press n`, "warning")
       }
+      setTimeout(refreshVisualMark, 150)
     }
 
     const stepSearch = (delta: number) => {
@@ -503,6 +623,138 @@ export default Plugin.define({
       } else {
         toast(`Match ${i + 1}/${ids.length} is outside the loaded view — scroll up to load it`, "warning")
       }
+      setTimeout(refreshVisualMark, 150)
+    }
+
+    // ---- visual mode ---------------------------------------------------------
+    // Anchor/mark are message ids. They coerce to indexes in the session message
+    // list at yank time, so ranges work even across the host's loaded window.
+
+    let visualBox: RNode | undefined | null // undefined = unknown, null = lookup failed
+
+    const ensureVisualBox = (msgs: any[]): RNode | null => {
+      if (visualBox) return visualBox
+      if (visualBox === null) return null
+      for (const m of msgs) {
+        const id = messageId(m)
+        if (!id) continue
+        const node = messageNode(context, id)
+        if (!node) continue
+        const box = findScrollBoxAncestor(node)
+        if (box) {
+          visualBox = box
+          return box
+        }
+      }
+      return null
+    }
+
+    const refreshVisualMark = () => {
+      if (!visual.active) return
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      if (!box) {
+        visualBox = null
+        return
+      }
+      const top = visibleTopMessageId(context, box, msgs)
+      if (!top || top === visual.markId) return
+      setVisual((draft: any) => {
+        draft.markId = top
+      })
+    }
+
+    let visualTimer: ReturnType<typeof setInterval> | undefined
+    const stopVisualPoll = () => {
+      if (visualTimer) {
+        clearInterval(visualTimer)
+        visualTimer = undefined
+      }
+    }
+    const startVisualPoll = () => {
+      stopVisualPoll()
+      refreshVisualMark()
+      visualTimer = setInterval(refreshVisualMark, 150)
+    }
+
+    const enterVisual = (linewise: boolean) => {
+      const sid = currentSession()
+      if (!sid) {
+        toast("Open a session to start visual mode", "warning")
+        return
+      }
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      const top = box ? visibleTopMessageId(context, box, msgs) : null
+      if (!top) {
+        toast("No message rendered in view — jump with [ ] or / first, then press v", "warning")
+        return
+      }
+      setVisual((draft: any) => {
+        draft.active = true
+        draft.linewise = linewise
+        draft.anchorId = top
+        draft.markId = top
+      })
+      startVisualPoll()
+      toast(
+        `${linewise ? "V" : "v"} visual: anchored at ${clip(messageText(msgs.find((m) => messageId(m) === top) as any), 36) || "message"} — j/k/… move · o swap · y yank · esc cancel`,
+      )
+    }
+
+    const exitVisual = () => {
+      stopVisualPoll()
+      setVisual((draft: any) => {
+        draft.active = false
+        draft.anchorId = null
+        draft.markId = null
+      })
+    }
+
+    const yankVisual = async () => {
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const idxOf = (id: string | null): number =>
+        id ? msgs.findIndex((m) => messageId(m) === id) : -1
+      let a: number
+      let b: number
+      if (visual.active) {
+        a = idxOf(visual.anchorId)
+        b = idxOf(visual.markId)
+      } else {
+        // Normal-mode y: yank the message currently at the top of the viewport.
+        const box = ensureVisualBox(msgs)
+        const top = box ? visibleTopMessageId(context, box, msgs) : null
+        a = idxOf(top)
+        b = a
+      }
+      if (a < 0 || b < 0) {
+        toast("Nothing under the viewport to yank — scroll a message into view first", "warning")
+        return
+      }
+      const text = rangeText(msgs, a, b, visual.linewise)
+      if (!text.trim()) {
+        toast("Selected messages have no text to copy", "warning")
+        return
+      }
+      const ok = await copyToSystemClipboard(context, text)
+      const n = Math.abs(b - a) + 1
+      if (ok) {
+        toast(`Yanked ${n} message${n === 1 ? "" : "s"} · ${text.length} chars → clipboard`, "success")
+      } else {
+        toast(`Copy failed — terminal likely blocks OSC52. Text preview: ${clip(text, 40)}`, "error")
+      }
+      if (visual.active) exitVisual()
+    }
+
+    // After a scroll dispatch the viewport settles on the next frame; update
+    // the visual mark then. Cheap no-op while visual mode is off.
+    const afterScroll = (fn: () => void) => () => {
+      fn()
+      setTimeout(refreshVisualMark, 120)
     }
 
     keymap.layer(() => {
@@ -520,6 +772,7 @@ export default Plugin.define({
             setState((draft: any) => {
               draft.active = next
             })
+            exitVisual()
             if (!next) {
               exitScroll()
               toast("Edit mode: editor enabled, readline keys restored")
@@ -528,7 +781,7 @@ export default Plugin.define({
             enterScroll()
             if (options.vim) {
               toast(
-                "Scroll mode: editor disabled · j/k line · ctrl+d/u half · ctrl+f/b page · gg/G ends · [ ] user msgs · / ? search · n/N match · q exit",
+                "Scroll mode: editor disabled · j/k line · ctrl+d/u half · ctrl+f/b page · gg/G ends · [ ] user msgs · v/V select · y yank · / ? search · n/N match · q exit",
               )
             } else {
               toast("Scroll mode: editor disabled · ctrl+u / ctrl+d scroll, ctrl+q back to edit")
@@ -538,21 +791,22 @@ export default Plugin.define({
       ]
 
       if (active) {
-        // Half-page scrolling — always available in scroll mode.
+        // Half-page scrolling — always available in scroll mode. In visual
+        // mode the mark follows the viewport ~120ms after each move.
         commands.push(
           {
             id: "scroll-mode.up",
             title: "Scroll half page up",
             group: "Scroll mode",
             bind: "ctrl+u",
-            run: () => keymap.dispatch(CMD.halfUp),
+            run: afterScroll(() => keymap.dispatch(CMD.halfUp)),
           },
           {
             id: "scroll-mode.down",
             title: "Scroll half page down",
             group: "Scroll mode",
             bind: "ctrl+d",
-            run: () => keymap.dispatch(CMD.halfDown),
+            run: afterScroll(() => keymap.dispatch(CMD.halfDown)),
           },
         )
 
@@ -563,56 +817,86 @@ export default Plugin.define({
               title: "Scroll line up",
               group: "Scroll mode",
               bind: "k",
-              run: () => keymap.dispatch(CMD.lineUp),
+              run: afterScroll(() => keymap.dispatch(CMD.lineUp)),
             },
             {
               id: "scroll-mode.line.down",
               title: "Scroll line down",
               group: "Scroll mode",
               bind: "j",
-              run: () => keymap.dispatch(CMD.lineDown),
+              run: afterScroll(() => keymap.dispatch(CMD.lineDown)),
             },
             {
               id: "scroll-mode.page.up",
               title: "Scroll page up",
               group: "Scroll mode",
               bind: "ctrl+b",
-              run: () => keymap.dispatch(CMD.pageUp),
+              run: afterScroll(() => keymap.dispatch(CMD.pageUp)),
             },
             {
               id: "scroll-mode.page.down",
               title: "Scroll page down",
               group: "Scroll mode",
               bind: "ctrl+f",
-              run: () => keymap.dispatch(CMD.pageDown),
+              run: afterScroll(() => keymap.dispatch(CMD.pageDown)),
             },
             {
               id: "scroll-mode.first",
               title: "Go to first message",
               group: "Scroll mode",
               bind: "gg",
-              run: () => keymap.dispatch(CMD.first),
+              run: afterScroll(() => keymap.dispatch(CMD.first)),
             },
             {
               id: "scroll-mode.last",
               title: "Go to last message",
               group: "Scroll mode",
               bind: "shift+g",
-              run: () => keymap.dispatch(CMD.last),
+              run: afterScroll(() => keymap.dispatch(CMD.last)),
             },
             {
               id: "scroll-mode.prev_user",
               title: "Previous user message",
               group: "Scroll mode",
               bind: "[",
-              run: () => keymap.dispatch(CMD.prevUser),
+              run: afterScroll(() => keymap.dispatch(CMD.prevUser)),
             },
             {
               id: "scroll-mode.next_user",
               title: "Next user message",
               group: "Scroll mode",
               bind: "]",
-              run: () => keymap.dispatch(CMD.nextUser),
+              run: afterScroll(() => keymap.dispatch(CMD.nextUser)),
+            },
+            {
+              id: "scroll-mode.visual.enter",
+              title: "Visual mode (select messages)",
+              group: "Scroll mode",
+              palette: true,
+              bind: "v",
+              run: () => {
+                if (!visual.active) enterVisual(false)
+              },
+            },
+            {
+              id: "scroll-mode.visual.enter.line",
+              title: "Visual mode (linewise)",
+              group: "Scroll mode",
+              palette: true,
+              bind: "shift+v",
+              run: () => {
+                if (!visual.active) enterVisual(true)
+              },
+            },
+            {
+              id: "scroll-mode.visual.yank",
+              title: visual.active ? "Yank selection to clipboard" : "Yank visible message",
+              group: "Scroll mode",
+              palette: true,
+              bind: "y",
+              run: () => {
+                void yankVisual()
+              },
             },
             {
               id: "scroll-mode.exit",
@@ -620,6 +904,12 @@ export default Plugin.define({
               group: "Scroll mode",
               bind: "q",
               run: () => {
+                // q is a vim-consistent "cancel" inside visual selection.
+                if (visual.active) {
+                  exitVisual()
+                  toast("Back to scroll mode")
+                  return
+                }
                 setState((draft: any) => {
                   draft.active = false
                 })
@@ -628,6 +918,36 @@ export default Plugin.define({
               },
             },
           )
+
+          if (visual.active) {
+            commands.push(
+              {
+                id: "scroll-mode.visual.swap",
+                title: "Swap anchor and cursor",
+                group: "Scroll mode",
+                palette: true,
+                bind: "o",
+                run: () => {
+                  setVisual((draft: any) => {
+                    const a = draft.anchorId
+                    draft.anchorId = draft.markId
+                    draft.markId = a
+                  })
+                  toast("Anchor and cursor swapped")
+                },
+              },
+              {
+                id: "scroll-mode.visual.cancel",
+                title: "Cancel selection (stay in scroll mode)",
+                group: "Scroll mode",
+                bind: "escape",
+                run: () => {
+                  exitVisual()
+                  toast("Back to scroll mode")
+                },
+              },
+            )
+          }
         }
 
         if (options.search) {
@@ -707,13 +1027,16 @@ export default Plugin.define({
       /* ignore */
     }
 
-    // If the plugin reloads while scroll mode was on, keep the editor locked.
+    // If the plugin reloads while scroll mode was on, keep the editor locked
+    // (and the visual poll running if a selection was active).
     const restoreIfActive = setTimeout(() => {
       if (state.active) enterScroll()
+      if (visual.active) startVisualPoll()
     }, 0)
 
     return () => {
       clearTimeout(restoreIfActive)
+      stopVisualPoll()
       detachGuard?.()
       detachCursorGuard?.()
       exitScroll()
