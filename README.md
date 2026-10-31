@@ -27,24 +27,26 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 
 ## Visual 选区与复制
 
-`v` / `V` 以**当前视口顶部的行**为锚点进入 visual 选区（行粒度）：
+`v` / `V` 以**当前视口顶部的行**为锚点进入 visual 选区：
 
 | 键 | 动作 |
 | --- | --- |
-| `v` / `V` | 进入 / 重进 visual（均按行选择） |
+| `v` | 进入 charwise（字符）选择：上下移动跨行，`h`/`l`（或 ←/→）在这一行左右扩展 |
+| `V` | 进入 linewise（整行）选择 |
 | `j` `k` `C-d` `C-u` `C-f` `C-b` `gg` `G` `[` `]` `n` `N` | 移动；游标（另一端）随视口自动跟随（~120ms 刷新） |
-| `o` | 交换锚点与游标 |
-| `y` | yank 选中的行（含跨消息）→ 系统剪贴板；退出 visual |
+| `h` / `l`、`←` / `→` | charwise 下向左 / 右扩展选区 |
+| `o` | 交换锚点与游标（视口会跟到新的游标端） |
+| `y` | yank 选中文本（含跨消息）→ 系统剪贴板；退出 visual |
 | `y`（非 visual） | 复制光标所在的那一行 |
 | `esc` / `q` | 取消选区，留在滚动模式 |
 
 复制通道：优先 **OSC52**（iTerm2 需在设置里允许终端访问剪贴板；tmux 需 `set -g set-clipboard on`；ssh 远端也可能直接生效），失败时回退 `pbcopy`（macOS）/ `wl-copy` / `xclip`（Linux）。
 
-### 视觉反馈（行光标 + 行选区）
+### 视觉反馈（行光标 + 选区）
 
-滚动模式下，**视口顶部的第一行文字**以主题选区色显示，作为「行光标」；按 `v` 后，锚点行到当前行之间的**整行范围**被选中着色，随滚动实时扩展/收缩。退出滚动模式或取消 visual 时立即清除。
+滚动模式下，**视口顶部的第一行**整行着色，作为「行光标」；按 `v` 后锚点行到当前行之间高亮，`h`/`l` 在当前行左右扩展，`V` 则按整行选中。退出滚动模式或取消 visual 时立即清除并恢复宿主原色。
 
-实现方式：调用宿主的选区 API（`renderer.startSelection(..., "line")` / `updateSelection` / `clearSelection`），与鼠标拖选走同一套渲染路径，所以颜色跟随主题、按真实文本行对齐，而不是给整条消息涂背景。宿主 renderable 不属于公开 API，调用失败会降级为 toast 提示并关闭高亮；可用 `highlight: false` 完全关闭。
+实现方式：调用宿主的选区 API（`renderer.startSelection` / `updateSelection` / `clearSelection`），与鼠标拖选走同一套渲染路径，按真实文本行对齐。由于宿主默认不给文本节点设置 `selectionBg`，插件会显式设置 `cursorColor` / `selectionColor`（退出时还原），否则选区可能完全看不见。宿主 renderable 不属于公开 API，调用失败会降级为 toast 提示；可用 `highlight: false` 完全关闭。
 
 ## 搜索
 
@@ -66,7 +68,9 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
         "search": true,
         "maxResults": 100,
         "searchScope": "all",
-        "highlight": true
+        "highlight": true,
+        "cursorColor": "#3d5a80",
+        "selectionColor": "#2f5d9e"
       }
     }
   ]
@@ -79,7 +83,9 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 | `search` | boolean | `true` | 是否启用消息搜索 |
 | `maxResults` | number | `100` | 搜索结果上限 |
 | `searchScope` | `"all"` \| `"user"` | `"all"` | 搜索范围 |
-| `highlight` | boolean | `true` | 行光标 / 行选区高亮 |
+| `highlight` | boolean | `true` | 行光标 / 选区高亮 |
+| `cursorColor` | string | `"#3d5a80"` | 行光标背景色 |
+| `selectionColor` | string | `"#2f5d9e"` | visual 选区背景色 |
 
 > 提示：同一目录若既位于自动加载的 `plugins/` 下、又在 `plugins` 中显式列出，可能被加载两次。二选一。
 

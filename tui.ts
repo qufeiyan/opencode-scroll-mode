@@ -62,6 +62,8 @@ type Options = {
   maxResults: number
   searchScope: "all" | "user"
   highlight: boolean
+  cursorColor: string
+  selectionColor: string
 }
 
 function readOptions(raw: unknown): Options {
@@ -73,6 +75,9 @@ function readOptions(raw: unknown): Options {
     maxResults: typeof maxRaw === "number" && maxRaw > 0 ? Math.floor(maxRaw) : 100,
     searchScope: o.searchScope === "user" ? "user" : "all",
     highlight: o.highlight !== false,
+    cursorColor: typeof o.cursorColor === "string" && o.cursorColor ? o.cursorColor : "#3d5a80",
+    selectionColor:
+      typeof o.selectionColor === "string" && o.selectionColor ? o.selectionColor : "#2f5d9e",
   }
 }
 
@@ -444,8 +449,10 @@ export default Plugin.define({
         linewise: false,
         anchorId: null as string | null,
         anchorLine: 0,
+        anchorCol: 0,
         markId: null as string | null,
         markLine: 0,
+        cursorCol: 0,
       },
     })
 
@@ -748,6 +755,49 @@ export default Plugin.define({
       }
     }
 
+    // The host leaves selectionBg undefined on these text nodes, which can
+    // make a selection invisible. We set our own color (saving the original)
+    // so the cursor line / range is always drawn, then restore on exit.
+    const savedSelBg = new WeakMap<object, any>()
+    const styledSel = new Set<RNode>()
+
+    const styleSelection = (node: RNode | null | undefined, color: string) => {
+      if (!node) return
+      try {
+        if ((node as any).isDestroyed) return
+        if (!("selectionBg" in (node as any))) return
+        if (!savedSelBg.has(node)) savedSelBg.set(node, (node as any).selectionBg)
+        ;(node as any).selectionBg = color
+        styledSel.add(node)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const restoreSelections = () => {
+      for (const node of styledSel) {
+        try {
+          if (!(node as any).isDestroyed) (node as any).selectionBg = savedSelBg.get(node)
+        } catch {
+          /* ignore */
+        }
+      }
+      styledSel.clear()
+    }
+
+    // Every selectable text node under a message, so a range that spans
+    // messages is colored consistently.
+    const collectSelectable = (node: RNode, out: RNode[], depth = 0) => {
+      if (depth > 10) return
+      try {
+        if ((node as any).selectable === true && !(node as any).isDestroyed) out.push(node)
+        const kids = (node as any).getChildren?.()
+        if (Array.isArray(kids)) for (const k of kids) collectSelectable(k as RNode, out, depth + 1)
+      } catch {
+        /* ignore */
+      }
+    }
+
     const clearLineSelection = () => {
       lastKey = null
       try {
@@ -755,6 +805,7 @@ export default Plugin.define({
       } catch {
         /* ignore */
       }
+      restoreSelections()
     }
 
     const idxInList = (msgs: any[], id: string | null): number =>
@@ -827,6 +878,33 @@ export default Plugin.define({
       return makeHit(id, node, line)
     }
 
+    // The anchor message can be culled once it scrolls out of the rendered
+    // window; fall back to the newest still-rendered message above it so the
+    // selection keeps a visible starting edge.
+    const fallbackAnchorHit = (msgs: any[], idx: number): VHit | null => {
+      for (let i = Math.min(idx, msgs.length - 1); i >= 0; i--) {
+        const id = messageId(msgs[i])
+        if (!id) continue
+        const node = resolveNodeCached(id)
+        if (!node) continue
+        const h = (node as any).height
+        return makeHit(id, node, typeof h === "number" && h > 1 ? Math.floor(h) - 1 : 0)
+      }
+      return null
+    }
+
+    const boxTopOf = (box: RNode | null): number =>
+      box && typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
+    const nodeX = (node: RNode): number =>
+      typeof (node as any).x === "number" ? Math.round((node as any).x) : 0
+    const nodeW = (node: RNode): number =>
+      typeof (node as any).width === "number" && (node as any).width > 1
+        ? Math.floor((node as any).width)
+        : 1
+    // Stored state can predate these fields (hot reload keeps memory state).
+    const colOf = (v: unknown): number =>
+      typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0
+
     const applyHighlight = () => {
       // A deferred refresh can land after scroll mode turned off; never paint
       // a selection outside scroll mode (exitScroll clears it).
@@ -843,8 +921,7 @@ export default Plugin.define({
         clearLineSelection()
         return
       }
-      const boxTop = typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
-      const cursor = topLineHit(msgs, boxTop)
+      const cursor = topLineHit(msgs, boxTopOf(box))
       if (!cursor) return
       // The visual mark follows the viewport top line; the anchor stays put.
       if (visual.active && (cursor.msgId !== visual.markId || cursor.msgLine !== visual.markLine)) {
@@ -853,8 +930,18 @@ export default Plugin.define({
           draft.markLine = cursor.msgLine
         })
       }
-      const anchor = visual.active ? hitInMessage(visual.anchorId, visual.anchorLine) : null
-      const key = `${visual.active ? "v" : "c"}|${anchor?.msgId ?? ""}:${anchor?.msgLine ?? -1}|${cursor.msgId}:${cursor.msgLine}`
+      const anchorIdx = visual.active ? idxInList(msgs, visual.anchorId) : -1
+      let anchor = visual.active ? hitInMessage(visual.anchorId, visual.anchorLine) : null
+      if (visual.active && !anchor) anchor = fallbackAnchorHit(msgs, anchorIdx)
+      const key = [
+        visual.active ? (visual.linewise ? "V" : "v") : "c",
+        anchor?.msgId ?? "",
+        anchor?.msgLine ?? -1,
+        visual.active ? colOf(visual.anchorCol) : 0,
+        cursor.msgId,
+        cursor.msgLine,
+        visual.active && !visual.linewise ? colOf(visual.cursorCol) : 0,
+      ].join("|")
       let hasSel = false
       try {
         hasSel = !!renderer?.hasSelection
@@ -865,20 +952,87 @@ export default Plugin.define({
       lastKey = key
       try {
         if (typeof renderer?.startSelection !== "function") throw new Error("selection API missing")
+        // Give every text node in the range an explicit selection color: the
+        // host leaves it undefined, which can make the highlight invisible.
+        if (visual.active) {
+          const a = idxInList(msgs, anchor?.msgId ?? visual.anchorId)
+          const b = idxInList(msgs, cursor.msgId)
+          if (a >= 0 && b >= 0) {
+            const lo = Math.min(a, b)
+            const hi = Math.max(a, b)
+            for (let i = lo; i <= hi; i++) {
+              const id = messageId(msgs[i])
+              if (!id) continue
+              const node = resolveNodeCached(id)
+              if (!node) continue
+              const out: RNode[] = []
+              collectSelectable(node, out)
+              for (const n of out) styleSelection(n, options.selectionColor)
+            }
+          }
+          styleSelection(anchor?.node, options.selectionColor)
+          styleSelection(cursor.node, options.selectionColor)
+        } else {
+          styleSelection(cursor.node, options.cursorColor)
+        }
+
         const start = anchor ?? cursor
-        const x = (node: RNode): number =>
-          typeof (node as any).x === "number" ? Math.round((node as any).x) : 0
-        // Absolute screen coordinates; "line" behavior snaps both ends to
-        // whole text lines, so this paints a clean line-wise range.
-        renderer.startSelection(start.node, x(start.node), start.screenY, "line")
-        renderer.updateSelection(cursor.node, x(cursor.node), cursor.screenY, { finishDragging: true })
+        if (!visual.active || visual.linewise) {
+          // A full-width row is a solid, obvious cursor bar (and "line"
+          // behavior makes V paint whole lines across messages).
+          const behavior = visual.active ? "line" : "cell"
+          renderer.startSelection(start.node, nodeX(start.node), start.screenY, behavior)
+          renderer.updateSelection(
+            cursor.node,
+            nodeX(cursor.node) + nodeW(cursor.node) - 1,
+            cursor.screenY,
+            { finishDragging: true },
+          )
+        } else {
+          // Charwise: h/l grow the selection horizontally on the last line.
+          renderer.startSelection(
+            start.node,
+            nodeX(start.node) + colOf(visual.anchorCol),
+            start.screenY,
+            "cell",
+          )
+          renderer.updateSelection(
+            cursor.node,
+            nodeX(cursor.node) + colOf(visual.cursorCol),
+            cursor.screenY,
+            { finishDragging: true },
+          )
+        }
         renderer.requestRender?.()
+        if (!renderer?.hasSelection && !selectionWarned) {
+          selectionWarned = true
+          toast("Highlight applied but the host reports no selection — run Dump viewport diagnostics", "warning")
+        }
       } catch {
         if (!selectionWarned) {
           selectionWarned = true
           toast("This OpenCode build lacks the selection API — line highlight unavailable", "warning")
         }
       }
+    }
+
+    // Move the charwise cursor horizontally (h/l or arrows) in visual mode.
+    const moveCol = (delta: number) => {
+      if (!visual.active || visual.linewise) return
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      const cursor = box ? topLineHit(msgs, boxTopOf(box)) : null
+      const max = cursor ? Math.max(0, nodeW(cursor.node) - 1) : 0
+      const cur = colOf(visual.cursorCol)
+      const next = Math.max(0, Math.min(max, cur + delta))
+      if (next === cur) return
+      setVisual((draft: any) => {
+        draft.cursorCol = next
+      })
+      lastKey = null
+      applyHighlight()
     }
 
     const startPoll = () => {
@@ -906,14 +1060,18 @@ export default Plugin.define({
         draft.linewise = linewise
         draft.anchorId = hit.msgId
         draft.anchorLine = hit.msgLine
+        draft.anchorCol = 0
         draft.markId = hit.msgId
         draft.markLine = hit.msgLine
+        draft.cursorCol = 0
       })
       lastKey = null
       applyHighlight()
       const pos = idxInList(msgs, hit.msgId) + 1
       toast(
-        `${linewise ? "V" : "v"} visual: msg ${pos}/${msgs.length} line ${hit.msgLine + 1} — j/k/… move · o swap · y yank · esc cancel`,
+        linewise
+          ? `V visual (line): msg ${pos}/${msgs.length} — j/k move · o swap · y yank · esc cancel`
+          : `v visual (char): msg ${pos}/${msgs.length} — j/k move · h/l left-right · o swap · y yank · esc cancel`,
       )
     }
 
@@ -922,8 +1080,10 @@ export default Plugin.define({
         draft.active = false
         draft.anchorId = null
         draft.anchorLine = 0
+        draft.anchorCol = 0
         draft.markId = null
         draft.markLine = 0
+        draft.cursorCol = 0
       })
       // Back to the single-line cursor on the next refresh.
       lastKey = null
@@ -1089,6 +1249,14 @@ export default Plugin.define({
                     msgLine: hit.msgLine,
                     node: String((hit.node as any)?.constructor?.name ?? ""),
                     selectable: (hit.node as any)?.selectable,
+                    width: (hit.node as any)?.width,
+                    selectionBg: (() => {
+                      try {
+                        return String((hit.node as any)?.selectionBg ?? "undefined")
+                      } catch {
+                        return null
+                      }
+                    })(),
                   }
                 : null,
               selectedText: (() => {
@@ -1292,16 +1460,54 @@ export default Plugin.define({
                 palette: true,
                 bind: "o",
                 run: () => {
+                  const oldAnchorId = visual.anchorId
+                  const oldAnchorLine = visual.anchorLine
+                  const oldAnchorCol = visual.anchorCol
                   setVisual((draft: any) => {
-                    const a = draft.anchorId
-                    const al = draft.anchorLine
                     draft.anchorId = draft.markId
                     draft.anchorLine = draft.markLine
-                    draft.markId = a
-                    draft.markLine = al
+                    draft.anchorCol = draft.cursorCol
+                    draft.markId = oldAnchorId
+                    draft.markLine = oldAnchorLine
+                    draft.cursorCol = oldAnchorCol
                   })
+                  // Follow the new cursor end with the viewport, otherwise the
+                  // poll would immediately re-sync the mark to the old spot.
+                  if (oldAnchorId) jumpToMessage(context, oldAnchorId)
+                  lastKey = null
+                  setTimeout(applyHighlight, 120)
                   toast("Anchor and cursor swapped")
                 },
+              },
+              {
+                id: "scroll-mode.visual.col.left",
+                title: "Extend selection left",
+                group: "Scroll mode",
+                palette: true,
+                bind: "h",
+                run: () => moveCol(-1),
+              },
+              {
+                id: "scroll-mode.visual.col.left.arrow",
+                title: "Extend selection left (arrow)",
+                group: "Scroll mode",
+                bind: "left",
+                run: () => moveCol(-1),
+              },
+              {
+                id: "scroll-mode.visual.col.right",
+                title: "Extend selection right",
+                group: "Scroll mode",
+                palette: true,
+                bind: "l",
+                run: () => moveCol(1),
+              },
+              {
+                id: "scroll-mode.visual.col.right.arrow",
+                title: "Extend selection right (arrow)",
+                group: "Scroll mode",
+                bind: "right",
+                run: () => moveCol(1),
               },
               {
                 id: "scroll-mode.visual.cancel",
