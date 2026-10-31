@@ -1068,7 +1068,9 @@ export default Plugin.define({
       if (!box) return
       const hit = topLineHit(msgs, boxTopOf(box))
       if (!hit) return
-      if (!barRgba) barRgba = colorFrom(box, options.barColor)
+      if (!barRgba) {
+        barRgba = colorFrom(box, options.barColor) ?? colorFrom(renderer, options.barColor)
+      }
       // One cell left of the text is the message gutter; clamp at the edge.
       barPos = { x: Math.max(0, nodeX(hit.node) - 1), y: hit.screenY }
     }
