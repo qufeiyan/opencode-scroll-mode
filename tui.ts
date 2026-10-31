@@ -62,23 +62,17 @@ type Options = {
   maxResults: number
   searchScope: "all" | "user"
   highlight: boolean
-  cursorColor: string
-  selectionColor: string
 }
 
 function readOptions(raw: unknown): Options {
   const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
   const maxRaw = o.maxResults
-  const color = (v: unknown, fallback: string): string =>
-    typeof v === "string" && /^(#|rgb|hsl)/i.test(v.trim()) ? v.trim() : fallback
   return {
     vim: o.vim !== false,
     search: o.search !== false,
     maxResults: typeof maxRaw === "number" && maxRaw > 0 ? Math.floor(maxRaw) : 100,
     searchScope: o.searchScope === "user" ? "user" : "all",
     highlight: o.highlight !== false,
-    cursorColor: color(o.cursorColor, "#233043"),
-    selectionColor: color(o.selectionColor, "#264f78"),
   }
 }
 
@@ -342,15 +336,53 @@ function visibleTopMessageId(
   return null
 }
 
-function rangeText(msgs: any[], aIdx: number, bIdx: number, linewise: boolean): string {
-  const s = Math.min(aIdx, bIdx)
-  const e = Math.max(aIdx, bIdx)
-  const texts: string[] = []
-  for (let i = s; i <= e && i < msgs.length; i++) {
-    const t = messageText(msgs[i])
-    if (t.trim()) texts.push(t)
+// Deepest child renderable covering absolute screen row `screenRow`. The
+// deepest match is what the selection machinery wants (a text node, not the
+// outer message box). Note: Renderable.x/y are absolute screen coordinates in
+// this build, so no parent offset accumulates while descending.
+function findLineNodeAt(root: RNode, screenRow: number, depth = 0): RNode | null {
+  if (depth > 10) return null
+  let kids: RNode[] = []
+  try {
+    const c = (root as any).getChildren?.()
+    if (Array.isArray(c)) kids = c as RNode[]
+  } catch {
+    return null
   }
-  return texts.join(linewise ? "\n" : "\n\n")
+  for (const child of kids) {
+    const cy = (child as any).y
+    const ch = (child as any).height
+    if (typeof cy !== "number" || typeof ch !== "number" || ch <= 0) continue
+    if (screenRow < cy || screenRow >= cy + ch) continue
+    const inner = findLineNodeAt(child, screenRow, depth + 1)
+    return inner ?? child
+  }
+  return null
+}
+
+// Line-range extraction: from (aIdx, aLine) to (bIdx, bLine), both lines
+// inclusive and measured from the top of each message's text.
+function rangeTextLines(
+  msgs: any[],
+  aIdx: number,
+  aLine: number,
+  bIdx: number,
+  bLine: number,
+): string {
+  if (aIdx < 0 || bIdx < 0 || msgs.length === 0) return ""
+  const forward = aIdx < bIdx || (aIdx === bIdx && aLine <= bLine)
+  const loIdx = forward ? aIdx : bIdx
+  const loLine = forward ? aLine : bLine
+  const hiIdx = forward ? bIdx : aIdx
+  const hiLine = forward ? bLine : aLine
+  const out: string[] = []
+  for (let i = loIdx; i <= hiIdx && i < msgs.length; i++) {
+    const lines = messageText(msgs[i]).split("\n")
+    const start = i === loIdx ? Math.max(0, loLine) : 0
+    const end = i === hiIdx ? Math.min(lines.length - 1, hiLine) : lines.length - 1
+    for (let l = start; l <= end; l++) out.push(lines[l] ?? "")
+  }
+  return out.join("\n")
 }
 
 // OSC52 first (works over ssh when the terminal allows it), then a native
@@ -403,14 +435,17 @@ export default Plugin.define({
     const [search, setSearch] = context.storage.memory("scroll-mode.search", {
       initial: { ids: [] as string[], index: -1, query: "" },
     })
-    // Visual selection: anchor/mark are message ids in the transcript.
-    // Mark follows the viewport so navigation keys grow the selection.
+    // Visual selection: anchor/mark are (message id, line index) pairs, where
+    // the line is measured from the top of that message's text. The mark
+    // follows the viewport top line, so navigation grows the selection.
     const [visual, setVisual] = context.storage.memory("scroll-mode.visual", {
       initial: {
         active: false,
         linewise: false,
         anchorId: null as string | null,
+        anchorLine: 0,
         markId: null as string | null,
+        markLine: 0,
       },
     })
 
@@ -492,7 +527,7 @@ export default Plugin.define({
 
     const exitScroll = () => {
       stopPoll()
-      restoreAllHighlights()
+      clearLineSelection()
       const target = savedFocus
       savedFocus = null
       restoreEditorCursor(target)
@@ -634,7 +669,7 @@ export default Plugin.define({
       } else {
         toast(`Match ${idx + 1}/${shown.length} is outside the loaded view — scroll up to load it, then press n`, "warning")
       }
-      setTimeout(refreshViewport, 150)
+      setTimeout(applyHighlight, 150)
     }
 
     const stepSearch = (delta: number) => {
@@ -655,7 +690,7 @@ export default Plugin.define({
       } else {
         toast(`Match ${i + 1}/${ids.length} is outside the loaded view — scroll up to load it`, "warning")
       }
-      setTimeout(refreshViewport, 150)
+      setTimeout(applyHighlight, 150)
     }
 
     // ---- visual mode ---------------------------------------------------------
@@ -696,13 +731,16 @@ export default Plugin.define({
       return null
     }
 
-    // ---- poll: visual mark + highlight overlay -------------------------------
-    // One 150ms poll drives everything that needs the viewport: the visual
-    // mark follows the top visible message, and message boxes get a background
-    // tint — a cursor bar in scroll mode, the whole range in visual mode.
-    // Host renderables are not public API, so every write is guarded and the
-    // original color is restored on exit.
+    // ---- line cursor / visual range highlight --------------------------------
+    // The cursor is one selected LINE at the top of the viewport; visual mode
+    // extends that selection to the anchor line. Highlighting goes through the
+    // host's own selection machinery (startSelection with "line" behavior), so
+    // it uses real text metrics and the theme's selection colors instead of
+    // tinting whole message boxes.
     let pollTimer: ReturnType<typeof setInterval> | undefined
+    let lastKey: string | null = null
+    let selectionWarned = false
+
     const stopPoll = () => {
       if (pollTimer) {
         clearInterval(pollTimer)
@@ -710,36 +748,10 @@ export default Plugin.define({
       }
     }
 
-    const savedBg = new WeakMap<object, any>()
-    const applied = new Map<RNode, string>()
-    let highlightUnsupported = false
-
-    const restoreNode = (node: RNode) => {
+    const clearLineSelection = () => {
+      lastKey = null
       try {
-        if ((node as any).isDestroyed) return
-        ;(node as any).backgroundColor = savedBg.get(node)
-      } catch {
-        /* ignore */
-      }
-    }
-
-    const restoreAllHighlights = () => {
-      for (const node of applied.keys()) restoreNode(node)
-      applied.clear()
-    }
-
-    const applyColor = (node: RNode, color: string) => {
-      try {
-        if (!("backgroundColor" in (node as any))) {
-          if (!highlightUnsupported) {
-            highlightUnsupported = true
-            toast("This OpenCode build does not expose message styles — no highlight", "warning")
-          }
-          return
-        }
-        if (!savedBg.has(node)) savedBg.set(node, (node as any).backgroundColor)
-        ;(node as any).backgroundColor = color
-        applied.set(node, color)
+        renderer?.clearSelection?.()
       } catch {
         /* ignore */
       }
@@ -748,11 +760,78 @@ export default Plugin.define({
     const idxInList = (msgs: any[], id: string | null): number =>
       id ? msgs.findIndex((m) => messageId(m) === id) : -1
 
-    const refreshViewport = () => {
+    // A hit is the renderable the host's selection code wants (deepest
+    // selectable text node), plus the ABSOLUTE screen row of the target line
+    // and the line index inside the message text (used by yank).
+    // Node coordinates: Renderable.x/y are absolute screen coordinates in this
+    // build, which is exactly what startSelection/updateSelection expect.
+    type VHit = { node: RNode; screenY: number; msgId: string; msgLine: number }
+
+    const pickSelectable = (node: RNode): RNode | null => {
+      let cur: any = node
+      for (let i = 0; i < 8 && cur; i++) {
+        if (cur.selectable === true && !cur.isDestroyed) return cur as RNode
+        cur = cur.parent
+      }
+      return null
+    }
+
+    const makeHit = (id: string, msgNode: RNode, localRow: number): VHit => {
+      const baseY = typeof (msgNode as any).y === "number" ? (msgNode as any).y : 0
+      const screenY = Math.round(baseY + localRow)
+      const inner = findLineNodeAt(msgNode, screenY)
+      const node = pickSelectable(inner ?? msgNode) ?? msgNode
+      return { node, screenY, msgId: id, msgLine: Math.max(0, Math.floor(localRow)) }
+    }
+
+    // The text line at absolute screen row `row` (the cursor line).
+    const hitAtScreenRow = (msgs: any[], row: number): VHit | null => {
+      for (const m of msgs) {
+        const id = messageId(m)
+        if (!id) continue
+        const node = resolveNodeCached(id)
+        if (!node) continue
+        const y = (node as any).y
+        const h = (node as any).height
+        if (typeof y !== "number" || typeof h !== "number" || h <= 0) continue
+        if (row < y || row >= y + h) continue
+        return makeHit(id, node, row - y)
+      }
+      return null
+    }
+
+    // The first text line visible from the top of the scroll viewport. A
+    // partially scrolled message contributes its clipped bottom, so the
+    // cursor sits on the first line that is actually on screen.
+    const topLineHit = (msgs: any[], top: number): VHit | null => {
+      for (const m of msgs) {
+        const id = messageId(m)
+        if (!id) continue
+        const node = resolveNodeCached(id)
+        if (!node) continue
+        const y = (node as any).y
+        const h = (node as any).height
+        if (typeof y !== "number" || typeof h !== "number" || h <= 0) continue
+        if (y + h <= top) continue
+        const row = Math.max(top, y)
+        if (row >= y + h) continue
+        return makeHit(id, node, row - y)
+      }
+      return null
+    }
+
+    const hitInMessage = (id: string | null, line: number): VHit | null => {
+      if (!id) return null
+      const node = resolveNodeCached(id)
+      if (!node) return null
+      return makeHit(id, node, line)
+    }
+
+    const applyHighlight = () => {
       // A deferred refresh can land after scroll mode turned off; never paint
-      // a highlight outside scroll mode.
-      if (!state.active) {
-        restoreAllHighlights()
+      // a selection outside scroll mode (exitScroll clears it).
+      if (!state.active || !options.highlight) {
+        lastKey = null
         return
       }
       const sid = currentSession()
@@ -761,54 +840,51 @@ export default Plugin.define({
       const box = ensureVisualBox(msgs)
       if (!box) {
         visualBox = null
-        restoreAllHighlights()
+        clearLineSelection()
         return
       }
-      const top = visibleTopMessageId(context, box, msgs, resolveNodeCached)
-      if (!top) return
-      // The visual mark follows the viewport; anchor stays put.
-      if (visual.active && top !== visual.markId) {
+      const boxTop = typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
+      const cursor = topLineHit(msgs, boxTop)
+      if (!cursor) return
+      // The visual mark follows the viewport top line; the anchor stays put.
+      if (visual.active && (cursor.msgId !== visual.markId || cursor.msgLine !== visual.markLine)) {
         setVisual((draft: any) => {
-          draft.markId = top
+          draft.markId = cursor.msgId
+          draft.markLine = cursor.msgLine
         })
       }
-      if (!options.highlight) return
-      const want = new Map<RNode, string>()
-      const add = (id: string | null, color: string) => {
-        if (!id) return
-        const node = resolveNodeCached(id)
-        if (node) want.set(node, color)
+      const anchor = visual.active ? hitInMessage(visual.anchorId, visual.anchorLine) : null
+      const key = `${visual.active ? "v" : "c"}|${anchor?.msgId ?? ""}:${anchor?.msgLine ?? -1}|${cursor.msgId}:${cursor.msgLine}`
+      let hasSel = false
+      try {
+        hasSel = !!renderer?.hasSelection
+      } catch {
+        /* ignore */
       }
-      if (visual.active) {
-        const a = idxInList(msgs, visual.anchorId)
-        const b = idxInList(msgs, top)
-        if (a >= 0 && b >= 0) {
-          const lo = Math.min(a, b)
-          const hi = Math.max(a, b)
-          for (let i = lo; i <= hi; i++) add(messageId(msgs[i]), options.selectionColor)
-        } else {
-          add(top, options.selectionColor)
+      if (key === lastKey && hasSel) return
+      lastKey = key
+      try {
+        if (typeof renderer?.startSelection !== "function") throw new Error("selection API missing")
+        const start = anchor ?? cursor
+        const x = (node: RNode): number =>
+          typeof (node as any).x === "number" ? Math.round((node as any).x) : 0
+        // Absolute screen coordinates; "line" behavior snaps both ends to
+        // whole text lines, so this paints a clean line-wise range.
+        renderer.startSelection(start.node, x(start.node), start.screenY, "line")
+        renderer.updateSelection(cursor.node, x(cursor.node), cursor.screenY, { finishDragging: true })
+        renderer.requestRender?.()
+      } catch {
+        if (!selectionWarned) {
+          selectionWarned = true
+          toast("This OpenCode build lacks the selection API — line highlight unavailable", "warning")
         }
-        // Keep the moving end slightly distinct so the cursor stays readable.
-        add(top, options.cursorColor)
-      } else {
-        add(top, options.cursorColor)
-      }
-      for (const node of Array.from(applied.keys())) {
-        if (!want.has(node)) {
-          restoreNode(node)
-          applied.delete(node)
-        }
-      }
-      for (const [node, color] of want) {
-        if (applied.get(node) !== color) applyColor(node, color)
       }
     }
 
     const startPoll = () => {
       stopPoll()
-      refreshViewport()
-      pollTimer = setInterval(refreshViewport, 150)
+      applyHighlight()
+      pollTimer = setInterval(applyHighlight, 150)
     }
 
     const enterVisual = (linewise: boolean) => {
@@ -819,21 +895,25 @@ export default Plugin.define({
       }
       const msgs = listMessages(sid)
       const box = ensureVisualBox(msgs)
-      const top = box ? visibleTopMessageId(context, box, msgs, resolveNodeCached) : null
-      if (!top) {
+      const boxTop = box && typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
+      const hit = box ? topLineHit(msgs, boxTop) : null
+      if (!hit) {
         toast("No message rendered in view — jump with [ ] or / first, then press v", "warning")
         return
       }
       setVisual((draft: any) => {
         draft.active = true
         draft.linewise = linewise
-        draft.anchorId = top
-        draft.markId = top
+        draft.anchorId = hit.msgId
+        draft.anchorLine = hit.msgLine
+        draft.markId = hit.msgId
+        draft.markLine = hit.msgLine
       })
-      refreshViewport()
-      const pos = idxInList(msgs, top) + 1
+      lastKey = null
+      applyHighlight()
+      const pos = idxInList(msgs, hit.msgId) + 1
       toast(
-        `${linewise ? "V" : "v"} visual: msg ${pos}/${msgs.length} — j/k/… move · o swap · y yank · esc cancel`,
+        `${linewise ? "V" : "v"} visual: msg ${pos}/${msgs.length} line ${hit.msgLine + 1} — j/k/… move · o swap · y yank · esc cancel`,
       )
     }
 
@@ -841,10 +921,13 @@ export default Plugin.define({
       setVisual((draft: any) => {
         draft.active = false
         draft.anchorId = null
+        draft.anchorLine = 0
         draft.markId = null
+        draft.markLine = 0
       })
-      // Selection tint goes away; the cursor bar returns on the next refresh.
-      refreshViewport()
+      // Back to the single-line cursor on the next refresh.
+      lastKey = null
+      applyHighlight()
     }
 
     const yankVisual = async () => {
@@ -854,30 +937,50 @@ export default Plugin.define({
       const idxOf = (id: string | null): number =>
         id ? msgs.findIndex((m) => messageId(m) === id) : -1
       let a: number
+      let aLine: number
       let b: number
+      let bLine: number
       if (visual.active) {
         a = idxOf(visual.anchorId)
+        aLine = visual.anchorLine
         b = idxOf(visual.markId)
+        bLine = visual.markLine
       } else {
-        // Normal-mode y: yank the message currently at the top of the viewport.
+        // Normal-mode y: yank the cursor line (the viewport top line).
         const box = ensureVisualBox(msgs)
-        const top = box ? visibleTopMessageId(context, box, msgs, resolveNodeCached) : null
-        a = idxOf(top)
+        const boxTop = box && typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
+        const hit = box ? topLineHit(msgs, boxTop) : null
+        if (!hit) {
+          toast("Nothing under the viewport to yank — scroll a line into view first", "warning")
+          return
+        }
+        a = idxOf(hit.msgId)
+        aLine = hit.msgLine
         b = a
+        bLine = hit.msgLine
       }
       if (a < 0 || b < 0) {
-        toast("Nothing under the viewport to yank — scroll a message into view first", "warning")
+        toast("Nothing under the viewport to yank — scroll a line into view first", "warning")
         return
       }
-      const text = rangeText(msgs, a, b, visual.linewise)
+      // Prefer the host selection text: it comes from the rendered lines, so
+      // it stays exact when text wraps. Fall back to plain-text slicing.
+      applyHighlight()
+      let text = ""
+      try {
+        text = renderer?.getSelection?.()?.getSelectedText?.() ?? ""
+      } catch {
+        /* ignore */
+      }
+      if (!text.trim()) text = rangeTextLines(msgs, a, aLine, b, bLine)
       if (!text.trim()) {
-        toast("Selected messages have no text to copy", "warning")
+        toast("Selected lines have no text to copy", "warning")
         return
       }
       const ok = await copyToSystemClipboard(context, text)
-      const n = Math.abs(b - a) + 1
+      const n = text.split("\n").length
       if (ok) {
-        toast(`Yanked ${n} message${n === 1 ? "" : "s"} · ${text.length} chars → clipboard`, "success")
+        toast(`Yanked ${n} line${n === 1 ? "" : "s"} · ${text.length} chars → clipboard`, "success")
       } else {
         toast(`Copy failed — terminal likely blocks OSC52. Text preview: ${clip(text, 40)}`, "error")
       }
@@ -888,7 +991,7 @@ export default Plugin.define({
     // the visual mark then. Cheap no-op while visual mode is off.
     const afterScroll = (fn: () => void) => () => {
       fn()
-      setTimeout(refreshViewport, 120)
+      setTimeout(applyHighlight, 120)
     }
 
     // Diagnostic dump: records what the renderer tree actually exposes at
@@ -961,6 +1064,42 @@ export default Plugin.define({
             checked.push(entry)
           }
           diag.checked = checked
+          diag.selectionApi = {
+            start: typeof renderer?.startSelection,
+            update: typeof renderer?.updateSelection,
+            clear: typeof renderer?.clearSelection,
+            hasSelection: (() => {
+              try {
+                return !!renderer?.hasSelection
+              } catch {
+                return null
+              }
+            })(),
+          }
+          const diagBox = ensureVisualBox(msgs)
+          if (diagBox) {
+            const top = typeof (diagBox as any).y === "number" ? Math.round((diagBox as any).y) : 0
+            const hit = topLineHit(msgs, top)
+            diag.lineCursor = {
+              boxTop: top,
+              hit: hit
+                ? {
+                    msgId: String(hit.msgId).slice(-10),
+                    screenY: hit.screenY,
+                    msgLine: hit.msgLine,
+                    node: String((hit.node as any)?.constructor?.name ?? ""),
+                    selectable: (hit.node as any)?.selectable,
+                  }
+                : null,
+              selectedText: (() => {
+                try {
+                  return String(renderer?.getSelection?.()?.getSelectedText?.() ?? "").slice(0, 160)
+                } catch {
+                  return null
+                }
+              })(),
+            }
+          }
           diag.visibleTopResult = visibleTopMessageId(context, ensureVisualBox(msgs) ?? ({ id: "no-box" } as RNode), msgs, resolveNodeCached)
         } catch (e: any) {
           diag.error = String(e?.stack ?? e)
@@ -1108,7 +1247,7 @@ export default Plugin.define({
             },
             {
               id: "scroll-mode.visual.yank",
-              title: visual.active ? "Yank selection to clipboard" : "Yank visible message",
+              title: visual.active ? "Yank selection lines to clipboard" : "Yank cursor line",
               group: "Scroll mode",
               palette: true,
               bind: "y",
@@ -1155,8 +1294,11 @@ export default Plugin.define({
                 run: () => {
                   setVisual((draft: any) => {
                     const a = draft.anchorId
+                    const al = draft.anchorLine
                     draft.anchorId = draft.markId
+                    draft.anchorLine = draft.markLine
                     draft.markId = a
+                    draft.markLine = al
                   })
                   toast("Anchor and cursor swapped")
                 },

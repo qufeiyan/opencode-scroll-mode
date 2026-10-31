@@ -27,24 +27,24 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 
 ## Visual 选区与复制
 
-`v` / `V` 以**当前视口顶部的消息**为锚点进入 visual 选区（消息粒度——transcript 由宿主渲染，插件无法做行内高亮，用 toast 提示代替）：
+`v` / `V` 以**当前视口顶部的行**为锚点进入 visual 选区（行粒度）：
 
 | 键 | 动作 |
 | --- | --- |
-| `v` / `V` | 进入 / 重进 visual（charwise / linewise 仅影响多消息间拼接） |
+| `v` / `V` | 进入 / 重进 visual（均按行选择） |
 | `j` `k` `C-d` `C-u` `C-f` `C-b` `gg` `G` `[` `]` `n` `N` | 移动；游标（另一端）随视口自动跟随（~120ms 刷新） |
 | `o` | 交换锚点与游标 |
-| `y` | yank 选区文本 → 系统剪贴板；退出 visual |
-| `y`（非 visual） | 复制当前视口顶部那条消息 |
+| `y` | yank 选中的行（含跨消息）→ 系统剪贴板；退出 visual |
+| `y`（非 visual） | 复制光标所在的那一行 |
 | `esc` / `q` | 取消选区，留在滚动模式 |
 
 复制通道：优先 **OSC52**（iTerm2 需在设置里允许终端访问剪贴板；tmux 需 `set -g set-clipboard on`；ssh 远端也可能直接生效），失败时回退 `pbcopy`（macOS）/ `wl-copy` / `xclip`（Linux）。
 
-### 视觉反馈（光标条 + 选区着色）
+### 视觉反馈（行光标 + 行选区）
 
-滚动模式下，**视口顶部那条消息会被着色**，作为「光标」位置提示；进入 visual 后，锚点到游标之间的所有消息整体着色，游标端颜色略深。退出滚动模式时恢复宿主原始配色。
+滚动模式下，**视口顶部的第一行文字**以主题选区色显示，作为「行光标」；按 `v` 后，锚点行到当前行之间的**整行范围**被选中着色，随滚动实时扩展/收缩。退出滚动模式或取消 visual 时立即清除。
 
-实现方式：给消息节点写 `backgroundColor`（宿主 renderable 不属于公开 API，写失败会自动降级为 toast 提示并关闭高亮）。可用 `highlight: false` 完全关闭，或用 `cursorColor` / `selectionColor` 自定义颜色。
+实现方式：调用宿主的选区 API（`renderer.startSelection(..., "line")` / `updateSelection` / `clearSelection`），与鼠标拖选走同一套渲染路径，所以颜色跟随主题、按真实文本行对齐，而不是给整条消息涂背景。宿主 renderable 不属于公开 API，调用失败会降级为 toast 提示并关闭高亮；可用 `highlight: false` 完全关闭。
 
 ## 搜索
 
@@ -65,7 +65,8 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
         "vim": true,
         "search": true,
         "maxResults": 100,
-        "searchScope": "all"
+        "searchScope": "all",
+        "highlight": true
       }
     }
   ]
@@ -78,9 +79,7 @@ OpenCode TUI 的「对话滚动模式」插件：一键切换编辑 / 滚动两�
 | `search` | boolean | `true` | 是否启用消息搜索 |
 | `maxResults` | number | `100` | 搜索结果上限 |
 | `searchScope` | `"all"` \| `"user"` | `"all"` | 搜索范围 |
-| `highlight` | boolean | `true` | 光标条 / 选区着色覆盖 |
-| `cursorColor` | string | `"#233043"` | 光标条背景色（hex / rgb） |
-| `selectionColor` | string | `"#264f78"` | visual 选区背景色 |
+| `highlight` | boolean | `true` | 行光标 / 行选区高亮 |
 
 > 提示：同一目录若既位于自动加载的 `plugins/` 下、又在 `plugins` 中显式列出，可能被加载两次。二选一。
 
