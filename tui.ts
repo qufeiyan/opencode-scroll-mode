@@ -3,11 +3,14 @@ import { Plugin } from "@opencode/plugin/tui"
 
 // Conversation scroll mode for the OpenCode TUI.
 //
-// - ctrl+q toggles between edit mode and scroll mode:
+// - a toggle key (options.toggleKey, default ctrl+[) switches between edit
+//   mode and scroll mode:
 //   * edit mode (default): the composer keeps its readline keys
 //     (ctrl+u delete-to-line-start, ctrl+d delete char, etc.).
-//   * scroll mode: navigation keys scroll the transcript by dispatching the
-//     built-in session.* commands, and (optionally) vim keys + message search.
+//   * scroll mode: navigation keys move a persistent line/column cursor through
+//     the transcript; j/k scroll the host only when the cursor hits a viewport
+//     edge. Scrolling itself is still delegated to the built-in session.*
+//     commands, and (optionally) vim keys + message search are enabled.
 // - Implemented as a reactive keymap layer: the layer factory reads the
 //   memory-store flag, so scroll/search bindings are registered only while
 //   scroll mode is on. The rest of the time those keys reach the composer.
@@ -19,13 +22,20 @@ import { Plugin } from "@opencode/plugin/tui"
 //   search       boolean  enable message search      (default true)
 //   maxResults   number   max search results shown   (default 100)
 //   searchScope  string   "all" | "user"             (default "all")
+//   toggleKey    string   toggle key chord           (default "ctrl+[")
 //
-// Visual mode (message granularity): v / V anchor on the message currently at
-// the top of the transcript viewport; navigation keys keep the other end
-// (mark) following the viewport; y copies the selected messages' plain text
-// to the system clipboard (OSC52, with pbcopy/xclip/wl-copy as fallback).
-// The host owns transcript rendering, so a true on-screen highlight is out of
-// reach for now — toasts announce anchor/range instead.
+// Cursor and visual mode (per rendered line): scroll mode always has a real
+// cursor at an absolute screen row + character column. j/k move it by line
+// (scrolling at the viewport edges), h/l, w/b/e and 0/$ move the character
+// end. v/V start a charwise/linewise selection at the cursor; j/k extend it,
+// h/l etc. adjust the moving end. y copies the exact rendered text (including
+// code blocks and soft-wrapped lines) to the system clipboard (OSC52, with
+// pbcopy/xclip/wl-copy as fallback); in normal mode y copies the cursor line.
+// Y copies every visible line. The line index is built from the render tree:
+// TextBufferRenderable/CodeRenderable `lineInfo` maps each visual row back to
+// its source line and wrap column, so code-block lines are first-class
+// citizens. The host's native selection draws the row/range highlight; a
+// post-process 1-cell bar marks the cursor's character cell.
 
 // Cursor hiding must survive plugin reloads and prompt re-focus/remount.
 // `showCursor` is an EditBufferRenderable option: blur() hides the native
@@ -61,6 +71,7 @@ type Options = {
   search: boolean
   maxResults: number
   searchScope: "all" | "user"
+  toggleKey: string
   highlight: boolean
   cursorColor: string
   selectionColor: string
@@ -75,6 +86,7 @@ function readOptions(raw: unknown): Options {
     search: o.search !== false,
     maxResults: typeof maxRaw === "number" && maxRaw > 0 ? Math.floor(maxRaw) : 100,
     searchScope: o.searchScope === "user" ? "user" : "all",
+    toggleKey: typeof o.toggleKey === "string" && o.toggleKey ? o.toggleKey : "ctrl+[",
     highlight: o.highlight !== false,
     cursorColor: typeof o.cursorColor === "string" && o.cursorColor ? o.cursorColor : "#3d5a80",
     selectionColor:
@@ -127,6 +139,83 @@ function hhmm(ts: number): string {
 function clip(s: string, n: number): string {
   const one = s.replace(/\s+/g, " ").trim()
   return one.length > n ? one.slice(0, n - 1) + "…" : one
+}
+
+// ---- display columns --------------------------------------------------------
+// OpenTUI reports wrap boundaries in terminal cells, not UTF-16 code units, so
+// a line containing wide CJK glyphs (or tabs) must be sliced by display width.
+// Native selection remains the source of truth for yanks; this is used by the
+// per-line index, word motions, and the fallback yank path.
+const WIDE: Array<[number, number]> = [
+  [0x1100, 0x115f],
+  [0x2e80, 0x303e],
+  [0x3041, 0x33ff],
+  [0x3400, 0x4dbf],
+  [0x4e00, 0x9fff],
+  [0xa000, 0xa4cf],
+  [0xa960, 0xa97f],
+  [0xac00, 0xd7a3],
+  [0xf900, 0xfaff],
+  [0xfe10, 0xfe19],
+  [0xfe30, 0xfe6f],
+  [0xff00, 0xff60],
+  [0xffe0, 0xffe6],
+  [0x1f300, 0x1f64f],
+  [0x1f900, 0x1f9ff],
+  [0x20000, 0x3fffd],
+]
+
+function cellWidth(ch: string): number {
+  const cp = ch.codePointAt(0) ?? 0
+  if (cp === 0) return 0
+  if (cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0
+  if (
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f)
+  ) {
+    return 0
+  }
+  for (const [lo, hi] of WIDE) if (cp >= lo && cp <= hi) return 2
+  return 1
+}
+
+function textCols(s: string): number {
+  let col = 0
+  for (const ch of s) col += ch === "\t" ? 4 - (col % 4) : cellWidth(ch)
+  return col
+}
+
+// Slice [start, start + width) in display columns. Tabs expand to the next
+// 4-column stop, matching the TUI's default text measurement.
+function sliceCols(s: string, start: number, width: number): string {
+  let col = 0
+  let out = ""
+  for (const ch of s) {
+    const w = ch === "\t" ? 4 - (col % 4) : cellWidth(ch)
+    const next = col + w
+    if (next > start && col < start + width) out += ch
+    col = next
+    if (col >= start + width) break
+  }
+  return out
+}
+
+function colToIndex(s: string, col: number): number {
+  let c = 0
+  let i = 0
+  for (const ch of s) {
+    if (c >= col) return i
+    c += ch === "\t" ? 4 - (c % 4) : cellWidth(ch)
+    i += ch.length
+  }
+  return s.length
+}
+
+function indexToCol(s: string, index: number): number {
+  return textCols(s.slice(0, Math.max(0, Math.min(s.length, index))))
 }
 
 // ---- renderer-tree jump (best effort) --------------------------------------
@@ -343,55 +432,6 @@ function visibleTopMessageId(
   return null
 }
 
-// Deepest child renderable covering absolute screen row `screenRow`. The
-// deepest match is what the selection machinery wants (a text node, not the
-// outer message box). Note: Renderable.x/y are absolute screen coordinates in
-// this build, so no parent offset accumulates while descending.
-function findLineNodeAt(root: RNode, screenRow: number, depth = 0): RNode | null {
-  if (depth > 10) return null
-  let kids: RNode[] = []
-  try {
-    const c = (root as any).getChildren?.()
-    if (Array.isArray(c)) kids = c as RNode[]
-  } catch {
-    return null
-  }
-  for (const child of kids) {
-    const cy = (child as any).y
-    const ch = (child as any).height
-    if (typeof cy !== "number" || typeof ch !== "number" || ch <= 0) continue
-    if (screenRow < cy || screenRow >= cy + ch) continue
-    const inner = findLineNodeAt(child, screenRow, depth + 1)
-    return inner ?? child
-  }
-  return null
-}
-
-// Line-range extraction: from (aIdx, aLine) to (bIdx, bLine), both lines
-// inclusive and measured from the top of each message's text.
-function rangeTextLines(
-  msgs: any[],
-  aIdx: number,
-  aLine: number,
-  bIdx: number,
-  bLine: number,
-): string {
-  if (aIdx < 0 || bIdx < 0 || msgs.length === 0) return ""
-  const forward = aIdx < bIdx || (aIdx === bIdx && aLine <= bLine)
-  const loIdx = forward ? aIdx : bIdx
-  const loLine = forward ? aLine : bLine
-  const hiIdx = forward ? bIdx : aIdx
-  const hiLine = forward ? bLine : aLine
-  const out: string[] = []
-  for (let i = loIdx; i <= hiIdx && i < msgs.length; i++) {
-    const lines = messageText(msgs[i]).split("\n")
-    const start = i === loIdx ? Math.max(0, loLine) : 0
-    const end = i === hiIdx ? Math.min(lines.length - 1, hiLine) : lines.length - 1
-    for (let l = start; l <= end; l++) out.push(lines[l] ?? "")
-  }
-  return out.join("\n")
-}
-
 // OSC52 first (works over ssh when the terminal allows it), then a native
 // helper binary as fallback (pbcopy on macOS, wl-copy/xclip on Linux).
 async function copyToSystemClipboard(context: any, text: string): Promise<boolean> {
@@ -442,18 +482,17 @@ export default Plugin.define({
     const [search, setSearch] = context.storage.memory("scroll-mode.search", {
       initial: { ids: [] as string[], index: -1, query: "" },
     })
-    // Visual selection: anchor/mark are (message id, line index) pairs, where
-    // the line is measured from the top of that message's text. The mark
-    // follows the viewport top line, so navigation grows the selection.
+    // Visual selection: a real line cursor over the rendered transcript. Rows
+    // are ABSOLUTE screen rows (the coordinate space the host's selection API
+    // uses); columns are display columns from the left edge of that line's
+    // text node. The anchor row stays fixed while the cursor moves.
     const [visual, setVisual] = context.storage.memory("scroll-mode.visual", {
       initial: {
         active: false,
         linewise: false,
-        anchorId: null as string | null,
-        anchorLine: 0,
+        anchorRow: 0,
         anchorCol: 0,
-        markId: null as string | null,
-        markLine: 0,
+        cursorRow: 0,
         cursorCol: 0,
       },
     })
@@ -678,7 +717,7 @@ export default Plugin.define({
       } else {
         toast(`Match ${idx + 1}/${shown.length} is outside the loaded view — scroll up to load it, then press n`, "warning")
       }
-      setTimeout(applyHighlight, 150)
+      syncCursorToEdge("top")
     }
 
     const stepSearch = (delta: number) => {
@@ -699,14 +738,12 @@ export default Plugin.define({
       } else {
         toast(`Match ${i + 1}/${ids.length} is outside the loaded view — scroll up to load it`, "warning")
       }
-      setTimeout(applyHighlight, 150)
+      syncCursorToEdge("top")
     }
 
     // ---- visual mode ---------------------------------------------------------
-    // Anchor/mark are message ids. They coerce to indexes in the session message
-    // list at yank time, so ranges work even across the host's loaded window.
-
-    let visualBox: RNode | undefined | null // undefined = unknown, null = lookup failed
+    // Cursor and selection rows are absolute screen rows; the cursor column is
+    // a display column inside the rendered line.
 
     // id -> renderer node. findDescendantById is a tree search, and a session
     // can hold 150+ rendered messages; caching keeps the 150ms visual poll
@@ -723,9 +760,25 @@ export default Plugin.define({
       return node
     }
 
+    let visualBox: RNode | undefined | null // undefined = unknown, null = lookup failed
+    let visualBoxStamp = 0
+    let visualBoxSession: string | null = null
+
     const ensureVisualBox = (msgs: any[]): RNode | null => {
+      const sid = currentSession()
+      if (
+        visualBox &&
+        ((visualBox as any).isDestroyed || (sid && visualBoxSession && visualBoxSession !== sid))
+      ) {
+        visualBox = undefined
+        visualBoxSession = null
+      }
       if (visualBox) return visualBox
-      if (visualBox === null) return null
+      const now = Date.now()
+      // Do not cache a miss forever: the first poll can run before the host
+      // has mounted the transcript.
+      if (visualBox === null && now - visualBoxStamp < 500) return null
+      visualBoxStamp = now
       for (const m of msgs) {
         const id = messageId(m)
         if (!id) continue
@@ -734,18 +787,20 @@ export default Plugin.define({
         const box = findScrollBoxAncestor(node)
         if (box) {
           visualBox = box
+          visualBoxSession = sid
           return box
         }
       }
+      visualBox = null
       return null
     }
 
     // ---- line cursor / visual range highlight --------------------------------
-    // The cursor is one selected LINE at the top of the viewport; visual mode
-    // extends that selection to the anchor line. Highlighting goes through the
-    // host's own selection machinery (startSelection with "line" behavior), so
-    // it uses real text metrics and the theme's selection colors instead of
-    // tinting whole message boxes.
+    // The cursor persists in both modes: normal scroll mode paints a full-line
+    // tint plus a character-cell bar, and visual mode extends the host's native
+    // selection from the anchor to the moving cursor. Highlighting goes through
+    // the host's own selection machinery, so it uses real text metrics and the
+    // theme's selection colors instead of tinting whole message boxes.
     let pollTimer: ReturnType<typeof setInterval> | undefined
     let lastKey: string | null = null
     let selectionWarned = false
@@ -787,19 +842,6 @@ export default Plugin.define({
       styledSel.clear()
     }
 
-    // Every selectable text node under a message, so a range that spans
-    // messages is colored consistently.
-    const collectSelectable = (node: RNode, out: RNode[], depth = 0) => {
-      if (depth > 10) return
-      try {
-        if ((node as any).selectable === true && !(node as any).isDestroyed) out.push(node)
-        const kids = (node as any).getChildren?.()
-        if (Array.isArray(kids)) for (const k of kids) collectSelectable(k as RNode, out, depth + 1)
-      } catch {
-        /* ignore */
-      }
-    }
-
     const clearLineSelection = () => {
       lastKey = null
       try {
@@ -810,95 +852,19 @@ export default Plugin.define({
       restoreSelections()
     }
 
-    const idxInList = (msgs: any[], id: string | null): number =>
-      id ? msgs.findIndex((m) => messageId(m) === id) : -1
-
-    // A hit is the renderable the host's selection code wants (deepest
-    // selectable text node), plus the ABSOLUTE screen row of the target line
-    // and the line index inside the message text (used by yank).
-    // Node coordinates: Renderable.x/y are absolute screen coordinates in this
-    // build, which is exactly what startSelection/updateSelection expect.
-    type VHit = { node: RNode; screenY: number; msgId: string; msgLine: number }
-
-    const pickSelectable = (node: RNode): RNode | null => {
-      let cur: any = node
-      for (let i = 0; i < 8 && cur; i++) {
-        if (cur.selectable === true && !cur.isDestroyed) return cur as RNode
-        cur = cur.parent
-      }
-      return null
-    }
-
-    const makeHit = (id: string, msgNode: RNode, localRow: number): VHit => {
-      const baseY = typeof (msgNode as any).y === "number" ? (msgNode as any).y : 0
-      const screenY = Math.round(baseY + localRow)
-      const inner = findLineNodeAt(msgNode, screenY)
-      const node = pickSelectable(inner ?? msgNode) ?? msgNode
-      return { node, screenY, msgId: id, msgLine: Math.max(0, Math.floor(localRow)) }
-    }
-
-    // The text line at absolute screen row `row` (the cursor line).
-    const hitAtScreenRow = (msgs: any[], row: number): VHit | null => {
-      for (const m of msgs) {
-        const id = messageId(m)
-        if (!id) continue
-        const node = resolveNodeCached(id)
-        if (!node) continue
-        const y = (node as any).y
-        const h = (node as any).height
-        if (typeof y !== "number" || typeof h !== "number" || h <= 0) continue
-        if (row < y || row >= y + h) continue
-        return makeHit(id, node, row - y)
-      }
-      return null
-    }
-
-    // The first text line visible from the top of the scroll viewport. A
-    // partially scrolled message contributes its clipped bottom, so the
-    // cursor sits on the first line that is actually on screen.
-    const topLineHit = (msgs: any[], top: number): VHit | null => {
-      for (const m of msgs) {
-        const id = messageId(m)
-        if (!id) continue
-        const node = resolveNodeCached(id)
-        if (!node) continue
-        const y = (node as any).y
-        const h = (node as any).height
-        if (typeof y !== "number" || typeof h !== "number" || h <= 0) continue
-        if (y + h <= top) continue
-        const row = Math.max(top, y)
-        if (row >= y + h) continue
-        return makeHit(id, node, row - y)
-      }
-      return null
-    }
-
-    const hitInMessage = (id: string | null, line: number): VHit | null => {
-      if (!id) return null
-      const node = resolveNodeCached(id)
-      if (!node) return null
-      return makeHit(id, node, line)
-    }
-
-    // The anchor message can be culled once it scrolls out of the rendered
-    // window; fall back to the newest still-rendered message above it so the
-    // selection keeps a visible starting edge.
-    const fallbackAnchorHit = (msgs: any[], idx: number): VHit | null => {
-      for (let i = Math.min(idx, msgs.length - 1); i >= 0; i--) {
-        const id = messageId(msgs[i])
-        if (!id) continue
-        const node = resolveNodeCached(id)
-        if (!node) continue
-        const h = (node as any).height
-        return makeHit(id, node, typeof h === "number" && h > 1 ? Math.floor(h) - 1 : 0)
-      }
-      return null
-    }
-
     const boxTopOf = (box: RNode | null): number =>
       box && typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
+    const boxHeightOf = (box: RNode | null): number => {
+      if (!box) return 0
+      const h = (box as any).height
+      if (typeof h === "number" && h > 0) return Math.floor(h)
+      const vh = (box as any).viewport?.height
+      return typeof vh === "number" && vh > 0 ? Math.floor(vh) : 0
+    }
     const nodeX = (node: RNode): number =>
       typeof (node as any).x === "number" ? Math.round((node as any).x) : 0
+    const nodeY = (node: RNode): number =>
+      typeof (node as any).y === "number" ? Math.round((node as any).y) : 0
     const nodeW = (node: RNode): number =>
       typeof (node as any).width === "number" && (node as any).width > 1
         ? Math.floor((node as any).width)
@@ -907,7 +873,181 @@ export default Plugin.define({
     const colOf = (v: unknown): number =>
       typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0
 
-    const applyHighlight = () => {
+    // ---- per-line index -----------------------------------------------------
+    // One entry per VISUAL line of every selectable text renderable in the
+    // transcript. `lineInfo` maps the visual row to a source line, a wrap
+    // index, and a display-column range; applying that range to `plainText`
+    // yields exactly what is painted on that row (code blocks included).
+    type LineEntry = { row: number; node: RNode; text: string }
+    type TextData = {
+      info: any
+      lines: string[]
+      count: number
+      baseBySource: Map<number, number>
+    }
+
+    // Selectable roots only: descending into a TextRenderable's TextNode
+    // children would duplicate its text. Non-selectable wrappers (ScrollBox,
+    // viewport, content) are traversed. Both the child list and the common
+    // content/viewport/wrapper fields are checked because the host build may
+    // expose the content wrapper only through one of them.
+    const collectSelectableRoots = (
+      node: RNode,
+      out: RNode[],
+      seen = new Set<object>(),
+      depth = 0,
+    ) => {
+      if (depth > 16) return
+      try {
+        if (!node || seen.has(node as any)) return
+        seen.add(node as any)
+        if ((node as any).isDestroyed || (node as any).visible === false) return
+        if ((node as any).selectable === true) {
+          out.push(node)
+          return
+        }
+        const kids: any[] = []
+        const list = (node as any).getChildren?.()
+        if (Array.isArray(list)) kids.push(...list)
+        for (const key of ["content", "viewport", "wrapper"] as const) {
+          const sub = (node as any)[key]
+          if (sub && typeof sub === "object") kids.push(sub)
+        }
+        for (const k of kids) collectSelectableRoots(k as RNode, out, seen, depth + 1)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const textCache = new WeakMap<object, { key: string; data: TextData | null }>()
+    const textDataOf = (node: RNode): TextData | null => {
+      try {
+        // `plainText` allocates the whole node text. It can be a large code
+        // block, and the 150ms poll would otherwise re-copy it on every tick.
+        // textLength/virtualLineCount/width/height change when streaming or
+        // re-wrapping makes the cached metadata stale.
+        const sig = [
+          typeof (node as any).textLength === "number" ? (node as any).textLength : "",
+          typeof (node as any).virtualLineCount === "number" ? (node as any).virtualLineCount : "",
+          typeof (node as any).width === "number" ? (node as any).width : "",
+          typeof (node as any).height === "number" ? (node as any).height : "",
+        ].join("|")
+        const cached = textCache.get(node)
+        if (cached && cached.key === sig) return cached.data
+        const plain =
+          typeof (node as any).plainText === "string"
+            ? (node as any).plainText
+            : typeof (node as any).content === "string"
+              ? (node as any).content
+              : ""
+        if (!plain) {
+          textCache.set(node, { key: sig, data: null })
+          return null
+        }
+        const lines = plain.split("\n")
+        let info: any = null
+        try {
+          info = (node as any).lineInfo ?? null
+        } catch {
+          info = null
+        }
+        const reported =
+          info?.lineSources?.length ??
+          info?.lineWidthCols?.length ??
+          (typeof (node as any).virtualLineCount === "number" ? (node as any).virtualLineCount : 0)
+        const count = Math.max(1, typeof reported === "number" && reported > 0 ? reported : lines.length)
+        const baseBySource = new Map<number, number>()
+        if (Array.isArray(info?.lineSources) && Array.isArray(info?.lineStartCols)) {
+          for (let i = 0; i < info.lineSources.length; i++) {
+            const src = info.lineSources[i]
+            if (!baseBySource.has(src)) baseBySource.set(src, info.lineStartCols[i] ?? 0)
+          }
+        }
+        const data = { info, lines, count, baseBySource }
+        textCache.set(node, { key: sig, data })
+        return data
+      } catch {
+        return null
+      }
+    }
+
+    const entryTextOf = (data: TextData, i: number): string => {
+      const info = data.info
+      if (!Array.isArray(info?.lineSources) || !Array.isArray(info?.lineWidthCols)) {
+        return data.lines[Math.min(i, data.lines.length - 1)] ?? ""
+      }
+      const src = info.lineSources[i] ?? i
+      const base = data.baseBySource.get(src) ?? 0
+      const start = Math.max(0, (info.lineStartCols?.[i] ?? base) - base)
+      const width = info.lineWidthCols[i]
+      const line = data.lines[src] ?? ""
+      return typeof width === "number" && width > 0 ? sliceCols(line, start, width) : line
+    }
+
+    const buildLineIndex = (box: RNode, visibleOnly: boolean): LineEntry[] => {
+      const roots: RNode[] = []
+      collectSelectableRoots(box, roots)
+      const top = boxTopOf(box)
+      const height = boxHeightOf(box) || 40
+      const bottom = top + height
+      const out: LineEntry[] = []
+      for (const node of roots) {
+        const data = textDataOf(node)
+        if (!data) continue
+        const scrollY =
+          typeof (node as any).scrollY === "number" ? Math.max(0, Math.floor((node as any).scrollY)) : 0
+        const y = nodeY(node)
+        for (let i = 0; i < data.count; i++) {
+          const row = y + i - scrollY
+          if (visibleOnly && (row < top || row >= bottom)) continue
+          out.push({ row, node, text: entryTextOf(data, i) })
+        }
+      }
+      out.sort((a, b) => a.row - b.row || nodeX(a.node) - nodeX(b.node))
+      // Overlapping renderables are rare; keep one entry per screen row and
+      // prefer the one that actually carries text.
+      const dedup: LineEntry[] = []
+      for (const e of out) {
+        const prev = dedup[dedup.length - 1]
+        if (prev && prev.row === e.row) {
+          // More than one selectable node can paint the same screen row (e.g.
+          // a selectable gutter beside code, or the two sides of a split
+          // diff). Keep the widest: that is the main content, not the gutter.
+          if (nodeW(e.node) > nodeW(prev.node) && (e.text.trim() || !prev.text.trim())) {
+            dedup[dedup.length - 1] = e
+          }
+          continue
+        }
+        dedup.push(e)
+      }
+      return dedup
+    }
+
+    const lineIndex = (box: RNode, visibleOnly = true): LineEntry[] =>
+      buildLineIndex(box, visibleOnly)
+
+    // Nearest entry to an absolute row. The cursor is normally set to an exact
+    // entry row, but page scrolls and hot reloads can leave it between rows.
+    const entryAtRow = (index: LineEntry[], row: number): LineEntry | null => {
+      if (index.length === 0) return null
+      let best = index[0]
+      let bestD = Math.abs(best.row - row)
+      for (const e of index) {
+        const d = Math.abs(e.row - row)
+        if (d < bestD) {
+          best = e
+          bestD = d
+        }
+        if (e.row === row) return e
+      }
+      return best
+    }
+
+    const maxColOf = (text: string): number => Math.max(0, textCols(text) - 1)
+    const clampCol = (col: unknown, text: string): number =>
+      Math.max(0, Math.min(maxColOf(text), colOf(col)))
+
+    const applyHighlight = (linewiseOverride?: boolean) => {
       // A deferred refresh can land after scroll mode turned off; never paint
       // a selection outside scroll mode (exitScroll clears it).
       if (!state.active || !options.highlight) {
@@ -923,26 +1063,55 @@ export default Plugin.define({
         clearLineSelection()
         return
       }
-      const cursor = topLineHit(msgs, boxTopOf(box))
-      if (!cursor) return
-      // The visual mark follows the viewport top line; the anchor stays put.
-      if (visual.active && (cursor.msgId !== visual.markId || cursor.msgLine !== visual.markLine)) {
-        setVisual((draft: any) => {
-          draft.markId = cursor.msgId
-          draft.markLine = cursor.msgLine
-        })
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) {
+        lastKey = null
+        clearLineSelection()
+        return
       }
-      const anchorIdx = visual.active ? idxInList(msgs, visual.anchorId) : -1
-      let anchor = visual.active ? hitInMessage(visual.anchorId, visual.anchorLine) : null
-      if (visual.active && !anchor) anchor = fallbackAnchorHit(msgs, anchorIdx)
+      const active = visual.active
+      const linewise = linewiseOverride ?? visual.linewise
+      let cursorRow = typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row
+      if (!active && !vis.some((e) => e.row === cursorRow)) {
+        // In normal scroll mode the cursor follows the viewport. A host scroll
+        // (mouse wheel, ctrl+d, etc.) can leave the stored row off-screen, so
+        // snap it to the nearest rendered line instead of pinning the
+        // highlight to the first line of the page.
+        const near = entryAtRow(vis, cursorRow)
+        if (near) cursorRow = near.row
+      }
+      const anchorRow = typeof visual.anchorRow === "number" ? visual.anchorRow : cursorRow
+      const full = active ? lineIndex(box, false) : vis
+      const cursor = entryAtRow(active ? full : vis, cursorRow)
+      if (!cursor) return
+      if (!active) {
+        const col = clampCol(visual.cursorCol, cursor.text)
+        if (cursor.row !== visual.cursorRow || col !== visual.cursorCol) {
+          setVisual((draft: any) => {
+            draft.cursorRow = cursor.row
+            draft.cursorCol = col
+          })
+        }
+      }
+      const anchor = active ? (entryAtRow(full, anchorRow) ?? cursor) : cursor
+      const anchorCol = active && !linewise ? clampCol(visual.anchorCol, anchor.text) : 0
+      const cursorCol =
+        active && !linewise
+          ? clampCol(visual.cursorCol, cursor.text)
+          : Math.max(0, nodeW(cursor.node) - 1)
+      const barCol = clampCol(visual.cursorCol, cursor.text)
+      const lo = Math.min(anchor.row, cursor.row)
+      const hi = Math.max(anchor.row, cursor.row)
       const key = [
-        visual.active ? (visual.linewise ? "V" : "v") : "c",
-        anchor?.msgId ?? "",
-        anchor?.msgLine ?? -1,
-        visual.active ? colOf(visual.anchorCol) : 0,
-        cursor.msgId,
-        cursor.msgLine,
-        visual.active && !visual.linewise ? colOf(visual.cursorCol) : 0,
+        active ? (linewise ? "V" : "v") : "c",
+        anchor.row,
+        nodeX(anchor.node),
+        anchorCol,
+        cursor.row,
+        nodeX(cursor.node),
+        active ? cursorCol : barCol,
+        lo,
+        hi,
       ].join("|")
       let hasSel = false
       try {
@@ -954,57 +1123,40 @@ export default Plugin.define({
       lastKey = key
       try {
         if (typeof renderer?.startSelection !== "function") throw new Error("selection API missing")
-        // Give every text node in the range an explicit selection color: the
-        // host leaves it undefined, which can make the highlight invisible.
-        if (visual.active) {
-          const a = idxInList(msgs, anchor?.msgId ?? visual.anchorId)
-          const b = idxInList(msgs, cursor.msgId)
-          if (a >= 0 && b >= 0) {
-            const lo = Math.min(a, b)
-            const hi = Math.max(a, b)
-            for (let i = lo; i <= hi; i++) {
-              const id = messageId(msgs[i])
-              if (!id) continue
-              const node = resolveNodeCached(id)
-              if (!node) continue
-              const out: RNode[] = []
-              collectSelectable(node, out)
-              for (const n of out) styleSelection(n, options.selectionColor)
-            }
-          }
-          styleSelection(anchor?.node, options.selectionColor)
-          styleSelection(cursor.node, options.selectionColor)
-        } else {
-          styleSelection(cursor.node, options.cursorColor)
+        // The host leaves selectionBg undefined on these nodes, which can make
+        // the highlight invisible. Color only the nodes that actually own a
+        // selected row; restore on exit.
+        for (const e of full) {
+          if (e.row < lo || e.row > hi) continue
+          styleSelection(e.node, active ? options.selectionColor : options.cursorColor)
         }
 
-        const start = anchor ?? cursor
-        if (!visual.active || visual.linewise) {
-          // A full-width row is a solid, obvious cursor bar (and "line"
-          // behavior makes V paint whole lines across messages).
-          const behavior = visual.active ? "line" : "cell"
-          renderer.startSelection(start.node, nodeX(start.node), start.screenY, behavior)
-          renderer.updateSelection(
-            cursor.node,
-            nodeX(cursor.node) + nodeW(cursor.node) - 1,
-            cursor.screenY,
-            { finishDragging: true },
-          )
-        } else {
-          // Charwise: h/l grow the selection horizontally on the last line.
-          renderer.startSelection(
-            start.node,
-            nodeX(start.node) + colOf(visual.anchorCol),
-            start.screenY,
-            "cell",
-          )
-          renderer.updateSelection(
-            cursor.node,
-            nodeX(cursor.node) + colOf(visual.cursorCol),
-            cursor.screenY,
-            { finishDragging: true },
-          )
+        const startX = nodeX(anchor.node) + (active && !linewise ? anchorCol : 0)
+        const focusX =
+          nodeX(cursor.node) + (active && !linewise ? cursorCol : Math.max(0, nodeW(cursor.node) - 1))
+        const behavior = active && linewise ? "line" : "cell"
+        renderer.startSelection(anchor.node, startX, anchor.row, behavior)
+        // startSelection roots the selection at the anchor's immediate parent.
+        // Climb to the transcript ScrollBox so a selection that crosses
+        // messages sees both ends, while unrelated UI (sidebar/status) stays
+        // out. `updateSelection(null, ...)` climbs exactly one level per call.
+        if (active) {
+          for (let i = 0; i < 10; i++) {
+            let container: any = null
+            try {
+              container = renderer.getSelectionContainer?.() ?? null
+            } catch {
+              /* ignore */
+            }
+            if (!container || container === box) break
+            try {
+              renderer.updateSelection(null, focusX, cursor.row)
+            } catch {
+              break
+            }
+          }
         }
+        renderer.updateSelection(cursor.node, focusX, cursor.row, { finishDragging: true })
         renderer.requestRender?.()
         if (!renderer?.hasSelection && !selectionWarned) {
           selectionWarned = true
@@ -1018,30 +1170,241 @@ export default Plugin.define({
       }
     }
 
-    // Move the charwise cursor horizontally (h/l or arrows) in visual mode.
-    const moveCol = (delta: number) => {
-      if (!visual.active || visual.linewise) return
+    // ---- cursor movement -----------------------------------------------------
+    // Scrolling stays in the host; the cursor only moves inside the current
+    // viewport. At an edge the host scrolls one line and the cursor stays on
+    // the edge row, exactly like vim's scrolloff behaviour.
+
+    const scrollVisual = (cmd: string, edge: "top" | "bottom") => {
+      keymap.dispatch(cmd)
+      setTimeout(() => {
+        if (!state.active) return
+        const sid = currentSession()
+        if (!sid) return
+        const msgs = listMessages(sid)
+        const box = ensureVisualBox(msgs)
+        if (!box) return
+        const vis = lineIndex(box, true)
+        if (vis.length === 0) return
+        const hit = edge === "top" ? vis[0] : vis[vis.length - 1]
+        setVisual((draft: any) => {
+          draft.cursorRow = hit.row
+          draft.cursorCol = clampCol(draft.cursorCol, hit.text)
+        })
+        lastKey = null
+        applyHighlight()
+      }, 140)
+    }
+
+    const afterPageScroll = (cmd: string) => {
+      const sid0 = currentSession()
+      const box0 = sid0 ? ensureVisualBox(listMessages(sid0)) : null
+      const before = box0 ? lineIndex(box0, true) : []
+      const row =
+        typeof visual.cursorRow === "number" ? visual.cursorRow : (before[0]?.row ?? 0)
+      keymap.dispatch(cmd)
+      setTimeout(() => {
+        if (!state.active) return
+        const sid = currentSession()
+        if (!sid) return
+        const msgs = listMessages(sid)
+        const box = ensureVisualBox(msgs)
+        if (!box) return
+        const vis = lineIndex(box, true)
+        if (vis.length === 0) return
+        const hit = entryAtRow(vis, row)
+        if (!hit) return
+        setVisual((draft: any) => {
+          draft.cursorRow = hit.row
+          draft.cursorCol = clampCol(draft.cursorCol, hit.text)
+        })
+        lastKey = null
+        applyHighlight()
+      }, 140)
+    }
+
+    const syncCursorToEdge = (edge: "top" | "bottom") => {
+      setTimeout(() => {
+        if (!state.active) return
+        const sid = currentSession()
+        if (!sid) return
+        const msgs = listMessages(sid)
+        const box = ensureVisualBox(msgs)
+        if (!box) return
+        const vis = lineIndex(box, true)
+        if (vis.length === 0) return
+        const hit = edge === "top" ? vis[0] : vis[vis.length - 1]
+        setVisual((draft: any) => {
+          draft.cursorRow = hit.row
+          draft.cursorCol = clampCol(draft.cursorCol, hit.text)
+        })
+        lastKey = null
+        applyHighlight()
+      }, 140)
+    }
+
+    const afterJump = (cmd: string, edge: "top" | "bottom") => {
+      keymap.dispatch(cmd)
+      syncCursorToEdge(edge)
+    }
+
+    const moveCursor = (delta: number) => {
+      if (!state.active) return
       const sid = currentSession()
       if (!sid) return
       const msgs = listMessages(sid)
       const box = ensureVisualBox(msgs)
-      const cursor = box ? topLineHit(msgs, boxTopOf(box)) : null
-      const max = cursor ? Math.max(0, nodeW(cursor.node) - 1) : 0
-      const cur = colOf(visual.cursorCol)
-      const next = Math.max(0, Math.min(max, cur + delta))
-      if (next === cur) return
+      if (!box) return
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) return
+      const currentRow = typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row
+      const cur = entryAtRow(vis, currentRow)
+      if (!cur) return
+      const at = vis.indexOf(cur)
+      const target = at + delta
+      if (target < 0) {
+        scrollVisual(CMD.lineUp, "top")
+        return
+      }
+      if (target >= vis.length) {
+        scrollVisual(CMD.lineDown, "bottom")
+        return
+      }
+      const hit = vis[target]
       setVisual((draft: any) => {
+        draft.cursorRow = hit.row
+        draft.cursorCol = clampCol(draft.cursorCol, hit.text)
+      })
+      lastKey = null
+      applyHighlight()
+    }
+
+    // Move the character cursor horizontally (h/l or arrows) in both modes.
+    // Linewise selection ignores columns, same as vim.
+    const moveCol = (delta: number) => {
+      if (!state.active || (visual.active && visual.linewise)) return
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      if (!box) return
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) return
+      const cur = entryAtRow(vis, typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row)
+      if (!cur) return
+      const curCol = colOf(visual.cursorCol)
+      const next = Math.max(0, Math.min(maxColOf(cur.text), curCol + delta))
+      if (next === curCol) return
+      setVisual((draft: any) => {
+        draft.cursorRow = cur.row
         draft.cursorCol = next
       })
       lastKey = null
       applyHighlight()
     }
 
-    // ---- left gutter bar ----------------------------------------------------
+    // w / b / e across the rendered lines (charwise only).
+    const moveWord = (kind: "w" | "b" | "e") => {
+      if (!state.active || (visual.active && visual.linewise)) return
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      if (!box) return
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) return
+      const cur = entryAtRow(vis, typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row)
+      if (!cur) return
+      const at = vis.indexOf(cur)
+      const text = cur.text
+      const isWord = (ch: string | undefined) => !!ch && /[\p{L}\p{N}_]/u.test(ch)
+      const idx = colToIndex(text, colOf(visual.cursorCol))
+      let nextEntry = cur
+      let nextIdx = idx
+      if (kind === "w") {
+        let i = idx + 1
+        while (i < text.length && isWord(text[i])) i++
+        while (i < text.length && !isWord(text[i])) i++
+        if (i >= text.length) {
+          const n = vis[at + 1]
+          if (n) {
+            nextEntry = n
+            nextIdx = 0
+          }
+        } else nextIdx = i
+      } else if (kind === "b") {
+        let i = idx - 1
+        while (i >= 0 && !isWord(text[i])) i--
+        while (i > 0 && isWord(text[i - 1])) i--
+        if (i < 0) {
+          const p = vis[at - 1]
+          if (p) {
+            nextEntry = p
+            nextIdx = Math.max(0, p.text.length - 1)
+          }
+        } else nextIdx = i
+      } else {
+        let i = idx + 1
+        while (i < text.length && !isWord(text[i])) i++
+        while (i < text.length && isWord(text[i])) i++
+        if (i >= text.length) {
+          const n = vis[at + 1]
+          if (n) {
+            nextEntry = n
+            nextIdx = 0
+          }
+        } else nextIdx = i > 0 ? i - 1 : 0
+      }
+      const nextCol = indexToCol(nextEntry.text, Math.min(nextIdx, Math.max(0, nextEntry.text.length - 1)))
+      setVisual((draft: any) => {
+        draft.cursorRow = nextEntry.row
+        draft.cursorCol = nextCol
+      })
+      lastKey = null
+      applyHighlight()
+    }
+
+    // 0 / $ in charwise mode.
+    const moveLineEdge = (kind: "start" | "end") => {
+      if (!state.active || (visual.active && visual.linewise)) return
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      if (!box) return
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) return
+      const cur = entryAtRow(vis, typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row)
+      if (!cur) return
+      setVisual((draft: any) => {
+        draft.cursorRow = cur.row
+        draft.cursorCol = kind === "start" ? 0 : maxColOf(cur.text)
+      })
+      lastKey = null
+      applyHighlight()
+    }
+
+    // Swap which end of the selection is the anchor.
+    const swapEnds = () => {
+      if (!visual.active) return
+      setVisual((draft: any) => {
+        const ar = draft.anchorRow
+        const ac = draft.anchorCol
+        draft.anchorRow = draft.cursorRow
+        draft.anchorCol = draft.cursorCol
+        draft.cursorRow = ar
+        draft.cursorCol = ac
+      })
+      lastKey = null
+      applyHighlight()
+      toast("Anchor and cursor swapped")
+    }
+
+    // ---- character cursor -----------------------------------------------
     // The host's selection may not be visible in every build. This 1-cell bar
-    // is painted straight into the frame in the renderer's post-process pass,
-    // so the current line always has a marker on its left edge, on top of
-    // whatever the transcript drew.
+    // is painted straight into the frame in the renderer's post-process pass
+    // at the cursor's character cell, so the column is visible on top of
+    // whatever the transcript drew (and of the host's line/range highlight).
     let barRgba: any = null
     let barPos: { x: number; y: number } | null = null
     let barStamp = 0
@@ -1066,13 +1429,19 @@ export default Plugin.define({
       const msgs = listMessages(sid)
       const box = ensureVisualBox(msgs)
       if (!box) return
-      const hit = topLineHit(msgs, boxTopOf(box))
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) return
+      const row =
+        typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row
+      const hit = vis.find((e) => e.row === row) ?? entryAtRow(vis, row)
       if (!hit) return
       if (!barRgba) {
         barRgba = colorFrom(box, options.barColor) ?? colorFrom(renderer, options.barColor)
       }
-      // One cell left of the text is the message gutter; clamp at the edge.
-      barPos = { x: Math.max(0, nodeX(hit.node) - 1), y: hit.screenY }
+      // Paint at the character cell. The cursor column is relative to the
+      // displayed line (wrapped segments and code rows included).
+      const col = clampCol(visual.cursorCol, hit.text)
+      barPos = { x: Math.max(0, nodeX(hit.node) + col), y: hit.row }
     }
 
     const drawCursorBar = (buffer: any) => {
@@ -1107,91 +1476,141 @@ export default Plugin.define({
       }
       const msgs = listMessages(sid)
       const box = ensureVisualBox(msgs)
-      const boxTop = box && typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
-      const hit = box ? topLineHit(msgs, boxTop) : null
-      if (!hit) {
-        toast("No message rendered in view — jump with [ ] or / first, then press v", "warning")
+      if (!box) {
+        toast("No message rendered in view — scroll up to load it first", "warning")
         return
       }
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) {
+        toast("No rendered text in view — scroll to a message first", "warning")
+        return
+      }
+      // Start where the normal-mode cursor is (row and column). This is what
+      // makes `l` then `v` select from the middle of a line.
+      const startRow =
+        typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row
+      const hit = entryAtRow(vis, startRow) ?? vis[0]
+      const startCol = clampCol(visual.cursorCol, hit.text)
       setVisual((draft: any) => {
         draft.active = true
         draft.linewise = linewise
-        draft.anchorId = hit.msgId
-        draft.anchorLine = hit.msgLine
-        draft.anchorCol = 0
-        draft.markId = hit.msgId
-        draft.markLine = hit.msgLine
-        draft.cursorCol = 0
+        draft.anchorRow = hit.row
+        draft.anchorCol = startCol
+        draft.cursorRow = hit.row
+        draft.cursorCol = startCol
       })
       lastKey = null
       applyHighlight()
-      const pos = idxInList(msgs, hit.msgId) + 1
+      const preview = clip(hit.text, 56) || "(blank line)"
       toast(
         linewise
-          ? `V visual (line): msg ${pos}/${msgs.length} — j/k move · o swap · y yank · esc cancel`
-          : `v visual (char): msg ${pos}/${msgs.length} — j/k move · h/l left-right · o swap · y yank · esc cancel`,
+          ? `VISUAL LINE · ${preview} — j/k move · o swap · y yank · esc cancel`
+          : `VISUAL · ${preview} — j/k move · h/l col · w/b/e word · 0/$ ends · y yank · esc cancel`,
       )
     }
 
     const exitVisual = () => {
       setVisual((draft: any) => {
         draft.active = false
-        draft.anchorId = null
-        draft.anchorLine = 0
-        draft.anchorCol = 0
-        draft.markId = null
-        draft.markLine = 0
-        draft.cursorCol = 0
+        draft.linewise = false
+        // Keep the cursor where visual mode left it; normal mode continues
+        // from the same row/column.
+        draft.anchorRow = draft.cursorRow
+        draft.anchorCol = draft.cursorCol
       })
       // Back to the single-line cursor on the next refresh.
       lastKey = null
       applyHighlight()
     }
 
-    const yankVisual = async () => {
+    // Text from the per-line index between two absolute rows. Used when the
+    // host's selection text is unavailable; exact for every rendered row,
+    // including code blocks and wrapped lines.
+    const textBetweenRows = (
+      rows: LineEntry[],
+      lo: number,
+      hi: number,
+      charwise: boolean,
+      loCol: number,
+      hiCol: number,
+    ): string => {
+      const picked = rows.filter((e) => e.row >= lo && e.row <= hi)
+      if (picked.length === 0) return ""
+      if (!charwise) return picked.map((e) => e.text).join("\n")
+      return picked
+        .map((e, i) => {
+          if (picked.length === 1) {
+            const start = Math.min(loCol, hiCol)
+            return sliceCols(e.text, start, Math.abs(hiCol - loCol) + 1)
+          }
+          if (i === 0) return sliceCols(e.text, loCol, Math.max(0, textCols(e.text) - loCol))
+          if (i === picked.length - 1) return sliceCols(e.text, 0, hiCol + 1)
+          return e.text
+        })
+        .join("\n")
+    }
+
+    const yankVisual = async (forceLinewise = false) => {
       const sid = currentSession()
       if (!sid) return
       const msgs = listMessages(sid)
-      const idxOf = (id: string | null): number =>
-        id ? msgs.findIndex((m) => messageId(m) === id) : -1
-      let a: number
-      let aLine: number
-      let b: number
-      let bLine: number
-      if (visual.active) {
-        a = idxOf(visual.anchorId)
-        aLine = visual.anchorLine
-        b = idxOf(visual.markId)
-        bLine = visual.markLine
-      } else {
-        // Normal-mode y: yank the cursor line (the viewport top line).
-        const box = ensureVisualBox(msgs)
-        const boxTop = box && typeof (box as any).y === "number" ? Math.round((box as any).y) : 0
-        const hit = box ? topLineHit(msgs, boxTop) : null
-        if (!hit) {
-          toast("Nothing under the viewport to yank — scroll a line into view first", "warning")
-          return
-        }
-        a = idxOf(hit.msgId)
-        aLine = hit.msgLine
-        b = a
-        bLine = hit.msgLine
-      }
-      if (a < 0 || b < 0) {
-        toast("Nothing under the viewport to yank — scroll a line into view first", "warning")
+      const box = ensureVisualBox(msgs)
+      if (!box) {
+        toast("Nothing rendered to yank — scroll a message into view first", "warning")
         return
       }
-      // Prefer the host selection text: it comes from the rendered lines, so
-      // it stays exact when text wraps. Fall back to plain-text slicing.
-      applyHighlight()
-      let text = ""
-      try {
-        text = renderer?.getSelection?.()?.getSelectedText?.() ?? ""
-      } catch {
-        /* ignore */
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) {
+        toast("No rendered text in view to yank", "warning")
+        return
       }
-      if (!text.trim()) text = rangeTextLines(msgs, a, aLine, b, bLine)
-      if (!text.trim()) {
+      const active = visual.active
+      const linewise = active ? forceLinewise || visual.linewise : false
+      const passiveRow =
+        entryAtRow(vis, typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0].row)?.row ??
+        vis[0].row
+      const anchorRow = active && typeof visual.anchorRow === "number" ? visual.anchorRow : passiveRow
+      const cursorRow = active && typeof visual.cursorRow === "number" ? visual.cursorRow : passiveRow
+      // Prefer the host selection: it is the exact rendered text (wrapping and
+      // code blocks included). The line index is the fallback.
+      let text = ""
+      if (active) {
+        lastKey = null
+        applyHighlight(linewise)
+        try {
+          text = renderer?.getSelection?.()?.getSelectedText?.() ?? ""
+        } catch {
+          /* ignore */
+        }
+      } else {
+        const hit = entryAtRow(vis, cursorRow)
+        if (hit) {
+          try {
+            renderer.startSelection(hit.node, nodeX(hit.node), hit.row, "cell")
+            renderer.updateSelection(hit.node, nodeX(hit.node) + nodeW(hit.node) - 1, hit.row, {
+              finishDragging: true,
+            })
+            text = renderer?.getSelection?.()?.getSelectedText?.() ?? ""
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      if (!text) {
+        const full = lineIndex(box, false)
+        const lo = Math.min(anchorRow, cursorRow)
+        const hi = Math.max(anchorRow, cursorRow)
+        const charwise = active && !linewise
+        const lowIsAnchor = anchorRow <= cursorRow
+        const loCol = charwise
+          ? clampCol(lowIsAnchor ? visual.anchorCol : visual.cursorCol, entryAtRow(full, lo)?.text ?? "")
+          : 0
+        const hiCol = charwise
+          ? clampCol(lowIsAnchor ? visual.cursorCol : visual.anchorCol, entryAtRow(full, hi)?.text ?? "")
+          : 0
+        text = textBetweenRows(full, lo, hi, charwise, loCol, hiCol)
+      }
+      if (!text) {
         toast("Selected lines have no text to copy", "warning")
         return
       }
@@ -1205,11 +1624,29 @@ export default Plugin.define({
       if (visual.active) exitVisual()
     }
 
-    // After a scroll dispatch the viewport settles on the next frame; update
-    // the visual mark then. Cheap no-op while visual mode is off.
-    const afterScroll = (fn: () => void) => () => {
-      fn()
-      setTimeout(applyHighlight, 120)
+    // Y (normal scroll mode): every rendered line currently in the viewport,
+    // top to bottom. This is the direct "get each displayed line" primitive.
+    const yankVisibleLines = async () => {
+      const sid = currentSession()
+      if (!sid) return
+      const msgs = listMessages(sid)
+      const box = ensureVisualBox(msgs)
+      if (!box) {
+        toast("Nothing rendered to copy — scroll a message into view first", "warning")
+        return
+      }
+      const vis = lineIndex(box, true)
+      if (vis.length === 0) {
+        toast("No rendered text in view to copy", "warning")
+        return
+      }
+      const text = vis.map((e) => e.text).join("\n")
+      const ok = await copyToSystemClipboard(context, text)
+      if (ok) {
+        toast(`Copied ${vis.length} visible line${vis.length === 1 ? "" : "s"} · ${text.length} chars → clipboard`, "success")
+      } else {
+        toast(`Copy failed — terminal likely blocks OSC52. Text preview: ${clip(text, 40)}`, "error")
+      }
     }
 
     // Diagnostic dump: records what the renderer tree actually exposes at
@@ -1296,15 +1733,65 @@ export default Plugin.define({
           }
           const diagBox = ensureVisualBox(msgs)
           if (diagBox) {
-            const top = typeof (diagBox as any).y === "number" ? Math.round((diagBox as any).y) : 0
-            const hit = topLineHit(msgs, top)
-            diag.lineCursor = {
+            const top = boxTopOf(diagBox)
+            const vis = lineIndex(diagBox, true)
+            const full = lineIndex(diagBox, false)
+            const hit = vis[0] ?? null
+            const roots: RNode[] = []
+            try {
+              collectSelectableRoots(diagBox, roots)
+            } catch {
+              /* ignore */
+            }
+            diag.visual = {
+              active: visual.active,
+              linewise: visual.linewise,
+              anchorRow: visual.anchorRow,
+              anchorCol: visual.anchorCol,
+              cursorRow: visual.cursorRow,
+              cursorCol: visual.cursorCol,
+            }
+            diag.selectionContainer = (() => {
+              try {
+                const c: any = renderer?.getSelectionContainer?.() ?? null
+                return c ? String(c.id ?? c.constructor?.name ?? "") : null
+              } catch {
+                return null
+              }
+            })()
+            diag.lineIndex = {
               boxTop: top,
-              hit: hit
+              boxHeight: boxHeightOf(diagBox),
+              count: vis.length,
+              fullCount: full.length,
+              firstRow: vis[0]?.row ?? null,
+              lastRow: vis[vis.length - 1]?.row ?? null,
+              cursor: {
+                row: visual.cursorRow,
+                col: visual.cursorCol,
+                hit: entryAtRow(vis, typeof visual.cursorRow === "number" ? visual.cursorRow : vis[0]?.row)
+                  ? {
+                      row: entryAtRow(vis, visual.cursorRow)?.row,
+                      text: entryAtRow(vis, visual.cursorRow)?.text.slice(0, 80),
+                    }
+                  : null,
+              },
+              roots: roots.slice(0, 40).map((r) => ({
+                id: String((r as any).id ?? "").slice(0, 40),
+                type: String((r as any).constructor?.name ?? ""),
+                selectable: (r as any).selectable,
+                x: (r as any).x,
+                y: (r as any).y,
+                width: (r as any).width,
+                height: (r as any).height,
+                lineInfo: !!(r as any).lineInfo,
+                sourceLines: (r as any).lineInfo?.lineSources?.length ?? null,
+                plainChars: typeof (r as any).plainText === "string" ? (r as any).plainText.length : null,
+              })),
+              first: hit
                 ? {
-                    msgId: String(hit.msgId).slice(-10),
-                    screenY: hit.screenY,
-                    msgLine: hit.msgLine,
+                    row: hit.row,
+                    text: hit.text.slice(0, 80),
                     node: String((hit.node as any)?.constructor?.name ?? ""),
                     selectable: (hit.node as any)?.selectable,
                     width: (hit.node as any)?.width,
@@ -1317,9 +1804,10 @@ export default Plugin.define({
                     })(),
                   }
                 : null,
+              lines: vis.slice(0, 40).map((e) => ({ row: e.row, text: e.text.slice(0, 80) })),
               selectedText: (() => {
                 try {
-                  return String(renderer?.getSelection?.()?.getSelectedText?.() ?? "").slice(0, 160)
+                  return String(renderer?.getSelection?.()?.getSelectedText?.() ?? "").slice(0, 240)
                 } catch {
                   return null
                 }
@@ -1349,7 +1837,7 @@ export default Plugin.define({
           title: "Toggle scroll mode",
           group: "Scroll mode",
           palette: true,
-          bind: "ctrl+q",
+          bind: options.toggleKey,
           run: () => {
             const next = !state.active
             setState((draft: any) => {
@@ -1364,32 +1852,32 @@ export default Plugin.define({
             enterScroll()
             if (options.vim) {
               toast(
-                "Scroll mode: editor disabled · j/k line · ctrl+d/u half · ctrl+f/b page · gg/G ends · [ ] user msgs · v/V select · y yank · / ? search · n/N match · q exit",
+                "Scroll mode: editor disabled · j/k cursor · h/l column · w/b/e word · 0/$ ends · ctrl+d/u half · ctrl+f/b page · gg/G ends · [ ] user msgs · v/V select from cursor · y yank · Y visible lines · / ? search · n/N match · q exit",
               )
             } else {
-              toast("Scroll mode: editor disabled · ctrl+u / ctrl+d scroll, ctrl+q back to edit")
+              toast(`Scroll mode: editor disabled · ctrl+u / ctrl+d scroll, ${options.toggleKey} back to edit`)
             }
           },
         },
       ]
 
       if (active) {
-        // Half-page scrolling — always available in scroll mode. In visual
-        // mode the mark follows the viewport ~120ms after each move.
+        // Half-page scrolling. The cursor keeps its screen row while the text
+        // scrolls under it, in both normal and visual mode.
         commands.push(
           {
             id: "scroll-mode.up",
-            title: "Scroll half page up",
+            title: "Move cursor / scroll half page up",
             group: "Scroll mode",
             bind: "ctrl+u",
-            run: afterScroll(() => keymap.dispatch(CMD.halfUp)),
+            run: () => afterPageScroll(CMD.halfUp),
           },
           {
             id: "scroll-mode.down",
-            title: "Scroll half page down",
+            title: "Move cursor / scroll half page down",
             group: "Scroll mode",
             bind: "ctrl+d",
-            run: afterScroll(() => keymap.dispatch(CMD.halfDown)),
+            run: () => afterPageScroll(CMD.halfDown),
           },
         )
 
@@ -1397,63 +1885,128 @@ export default Plugin.define({
           commands.push(
             {
               id: "scroll-mode.line.up",
-              title: "Scroll line up",
+              title: "Move cursor up",
               group: "Scroll mode",
               bind: "k",
-              run: afterScroll(() => keymap.dispatch(CMD.lineUp)),
+              run: () => moveCursor(-1),
             },
             {
               id: "scroll-mode.line.down",
-              title: "Scroll line down",
+              title: "Move cursor down",
               group: "Scroll mode",
               bind: "j",
-              run: afterScroll(() => keymap.dispatch(CMD.lineDown)),
+              run: () => moveCursor(1),
+            },
+            {
+              id: "scroll-mode.cursor.col.left",
+              title: visual.active ? "Extend selection left" : "Move cursor left",
+              group: "Scroll mode",
+              palette: true,
+              bind: "h",
+              run: () => moveCol(-1),
+            },
+            {
+              id: "scroll-mode.cursor.col.left.arrow",
+              title: visual.active ? "Extend selection left (arrow)" : "Move cursor left (arrow)",
+              group: "Scroll mode",
+              bind: "left",
+              run: () => moveCol(-1),
+            },
+            {
+              id: "scroll-mode.cursor.col.right",
+              title: visual.active ? "Extend selection right" : "Move cursor right",
+              group: "Scroll mode",
+              palette: true,
+              bind: "l",
+              run: () => moveCol(1),
+            },
+            {
+              id: "scroll-mode.cursor.col.right.arrow",
+              title: visual.active ? "Extend selection right (arrow)" : "Move cursor right (arrow)",
+              group: "Scroll mode",
+              bind: "right",
+              run: () => moveCol(1),
+            },
+            {
+              id: "scroll-mode.cursor.word.next",
+              title: visual.active ? "Extend selection to next word" : "Move to next word",
+              group: "Scroll mode",
+              bind: "w",
+              run: () => moveWord("w"),
+            },
+            {
+              id: "scroll-mode.cursor.word.prev",
+              title: visual.active ? "Extend selection to previous word" : "Move to previous word",
+              group: "Scroll mode",
+              bind: "b",
+              run: () => moveWord("b"),
+            },
+            {
+              id: "scroll-mode.cursor.word.end",
+              title: visual.active ? "Extend selection to end of word" : "Move to end of word",
+              group: "Scroll mode",
+              bind: "e",
+              run: () => moveWord("e"),
+            },
+            {
+              id: "scroll-mode.cursor.line.start",
+              title: visual.active ? "Extend selection to line start" : "Move to line start",
+              group: "Scroll mode",
+              bind: "0",
+              run: () => moveLineEdge("start"),
+            },
+            {
+              id: "scroll-mode.cursor.line.end",
+              title: visual.active ? "Extend selection to line end" : "Move to line end",
+              group: "Scroll mode",
+              bind: "$",
+              run: () => moveLineEdge("end"),
             },
             {
               id: "scroll-mode.page.up",
-              title: "Scroll page up",
+              title: "Move cursor / scroll page up",
               group: "Scroll mode",
               bind: "ctrl+b",
-              run: afterScroll(() => keymap.dispatch(CMD.pageUp)),
+              run: () => afterPageScroll(CMD.pageUp),
             },
             {
               id: "scroll-mode.page.down",
-              title: "Scroll page down",
+              title: "Move cursor / scroll page down",
               group: "Scroll mode",
               bind: "ctrl+f",
-              run: afterScroll(() => keymap.dispatch(CMD.pageDown)),
+              run: () => afterPageScroll(CMD.pageDown),
             },
             {
               id: "scroll-mode.first",
               title: "Go to first message",
               group: "Scroll mode",
               bind: "gg",
-              run: afterScroll(() => keymap.dispatch(CMD.first)),
+              run: () => afterJump(CMD.first, "top"),
             },
             {
               id: "scroll-mode.last",
               title: "Go to last message",
               group: "Scroll mode",
               bind: "shift+g",
-              run: afterScroll(() => keymap.dispatch(CMD.last)),
+              run: () => afterJump(CMD.last, "bottom"),
             },
             {
               id: "scroll-mode.prev_user",
               title: "Previous user message",
               group: "Scroll mode",
               bind: "[",
-              run: afterScroll(() => keymap.dispatch(CMD.prevUser)),
+              run: () => afterJump(CMD.prevUser, "top"),
             },
             {
               id: "scroll-mode.next_user",
               title: "Next user message",
               group: "Scroll mode",
               bind: "]",
-              run: afterScroll(() => keymap.dispatch(CMD.nextUser)),
+              run: () => afterJump(CMD.nextUser, "top"),
             },
             {
               id: "scroll-mode.visual.enter",
-              title: "Visual mode (select messages)",
+              title: "Visual mode (charwise, from the cursor)",
               group: "Scroll mode",
               palette: true,
               bind: "v",
@@ -1463,7 +2016,7 @@ export default Plugin.define({
             },
             {
               id: "scroll-mode.visual.enter.line",
-              title: "Visual mode (linewise)",
+              title: "Visual mode (linewise, from the cursor)",
               group: "Scroll mode",
               palette: true,
               bind: "shift+v",
@@ -1473,12 +2026,23 @@ export default Plugin.define({
             },
             {
               id: "scroll-mode.visual.yank",
-              title: visual.active ? "Yank selection lines to clipboard" : "Yank cursor line",
+              title: visual.active ? "Yank selection to clipboard" : "Yank cursor line",
               group: "Scroll mode",
               palette: true,
               bind: "y",
               run: () => {
                 void yankVisual()
+              },
+            },
+            {
+              id: "scroll-mode.copy.visible",
+              title: visual.active ? "Yank selection (linewise)" : "Copy every visible line",
+              group: "Scroll mode",
+              palette: true,
+              bind: "shift+y",
+              run: () => {
+                if (visual.active) void yankVisual(true)
+                else void yankVisibleLines()
               },
             },
             {
@@ -1517,55 +2081,7 @@ export default Plugin.define({
                 group: "Scroll mode",
                 palette: true,
                 bind: "o",
-                run: () => {
-                  const oldAnchorId = visual.anchorId
-                  const oldAnchorLine = visual.anchorLine
-                  const oldAnchorCol = visual.anchorCol
-                  setVisual((draft: any) => {
-                    draft.anchorId = draft.markId
-                    draft.anchorLine = draft.markLine
-                    draft.anchorCol = draft.cursorCol
-                    draft.markId = oldAnchorId
-                    draft.markLine = oldAnchorLine
-                    draft.cursorCol = oldAnchorCol
-                  })
-                  // Follow the new cursor end with the viewport, otherwise the
-                  // poll would immediately re-sync the mark to the old spot.
-                  if (oldAnchorId) jumpToMessage(context, oldAnchorId)
-                  lastKey = null
-                  setTimeout(applyHighlight, 120)
-                  toast("Anchor and cursor swapped")
-                },
-              },
-              {
-                id: "scroll-mode.visual.col.left",
-                title: "Extend selection left",
-                group: "Scroll mode",
-                palette: true,
-                bind: "h",
-                run: () => moveCol(-1),
-              },
-              {
-                id: "scroll-mode.visual.col.left.arrow",
-                title: "Extend selection left (arrow)",
-                group: "Scroll mode",
-                bind: "left",
-                run: () => moveCol(-1),
-              },
-              {
-                id: "scroll-mode.visual.col.right",
-                title: "Extend selection right",
-                group: "Scroll mode",
-                palette: true,
-                bind: "l",
-                run: () => moveCol(1),
-              },
-              {
-                id: "scroll-mode.visual.col.right.arrow",
-                title: "Extend selection right (arrow)",
-                group: "Scroll mode",
-                bind: "right",
-                run: () => moveCol(1),
+                run: () => swapEnds(),
               },
               {
                 id: "scroll-mode.visual.cancel",
