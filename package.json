@@ -1,6 +1,7 @@
 {
   "name": "opencode-scroll-mode",
-  "version": "0.3.2",
+  "version": "0.3.3",
+  "license": "MIT",
   "description": "OpenCode TUI scroll mode plugin — toggle edit/scroll states with vim keys, message search, and line-precise visual selection/copy",
   "type": "module",
   "exports": {

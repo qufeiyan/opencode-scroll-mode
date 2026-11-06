@@ -496,6 +496,12 @@ export default Plugin.define({
         cursorCol: 0,
       },
     })
+    // True while a widget other than the composer owns focus (the command
+    // palette, search, selects, …). While true the scroll keymap is suspended
+    // so typing in that dialog doesn't move the background cursor.
+    const [focusState, setFocusState] = context.storage.memory("scroll-mode.focus", {
+      initial: { foreign: false },
+    })
 
     // ---- editor lock while scroll mode is on -------------------------------
     // Scroll mode owns the keyboard: the composer must not receive text, or
@@ -515,6 +521,7 @@ export default Plugin.define({
     let savedFocus: any = null
     let detachGuard: (() => void) | undefined
     let detachCursorGuard: (() => void) | undefined
+    let detachFocusGuard: (() => void) | undefined
 
     const focusedRenderable = (): any => {
       try {
@@ -576,6 +583,9 @@ export default Plugin.define({
     const exitScroll = () => {
       stopPoll()
       clearLineSelection()
+      setFocusState((draft: any) => {
+        if (draft.foreign) draft.foreign = false
+      })
       const target = savedFocus
       savedFocus = null
       restoreEditorCursor(target)
@@ -594,11 +604,66 @@ export default Plugin.define({
       }
     }
 
+    // Suspend everything scroll mode paints, without leaving scroll mode.
+    //
+    // The user-visible bug: while a dialog (command palette, prompt, select)
+    // owns focus, the transcript highlight could still be re-resolved against
+    // the live layout and repaint a different line, which reads as "the
+    // background cursor jumps". Exiting scroll mode entirely is not an option:
+    // exitScroll() calls focus() on the saved composer and would steal focus
+    // back from the dialog. So on dialog focus we tear down the visual layer
+    // and stop the poll, and on focus return we rebuild it.
+    //
+    // This also covers our own dialogs (search prompt, selects): typing there
+    // no longer has any chance of moving the transcript cursor.
+    const applyFocusState = (foreign: boolean) => {
+      if (!state.active) return
+      const changed = focusState.foreign !== foreign
+      if (changed) {
+        setFocusState((draft: any) => {
+          draft.foreign = foreign
+        })
+      }
+      if (!changed) return
+      if (foreign) {
+        // Dialog took focus: no poll, no selection, no cursor bar.
+        stopPoll()
+        lastKey = null
+        barPos = null
+        clearLineSelection()
+        try {
+          renderer?.requestRender?.()
+        } catch {
+          /* ignore */
+        }
+      } else {
+        // Dialog closed: rebuild the highlight from the current layout.
+        lastKey = null
+        startPoll()
+      }
+    }
+
+    // Imperative focus check, read by each command's run() at execution time.
+    // The layer's reactive suspension (focusState.foreign) does not reliably
+    // re-evaluate on every host, so we do not trust a stored flag here: the
+    // command itself re-reads the live focus the moment it fires. Returns true
+    // when a dialog (or any widget other than the saved composer) owns focus.
+    const dialogHasFocus = (): boolean => {
+      if (!state.active) return false
+      const focused = focusedRenderable()
+      return !!focused && focused !== savedFocus
+    }
+
     const onKey = (key: any) => {
       if (!state.active) return
       const focused = focusedRenderable()
-      // A dialog or other widget has taken focus: let it receive input.
-      if (focused && focused !== savedFocus) return
+      // A dialog or other widget has taken focus: suspend the scroll keymap and
+      // let it receive input. Sync here too (not only via focused_renderable)
+      // so the suspension is in place before the next keystroke reaches the
+      // dispatcher, even if the host doesn't emit the focus event.
+      const foreign = !!focused && focused !== savedFocus
+      applyFocusState(foreign)
+      if (foreign) return
       if (focused) hideEditorCursor(focused)
       try {
         key.preventDefault()
@@ -620,6 +685,16 @@ export default Plugin.define({
       } catch {
         /* ignore */
       }
+    }
+
+    // Track whether a widget other than the composer owns focus. While scroll
+    // mode is active and a dialog (palette, search, select) has focus, the
+    // scroll keymap is suspended so the dialog receives every key and the
+    // background cursor doesn't jump while typing.
+    const onFocusChange = (current: any) => {
+      if (!state.active) return
+      const foreign = !!current && current !== savedFocus
+      applyFocusState(foreign)
     }
 
     const toast = (message: string, variant?: "info" | "success" | "warning" | "error") => {
@@ -1446,7 +1521,9 @@ export default Plugin.define({
 
     const drawCursorBar = (buffer: any) => {
       try {
-        if (!state.active || !options.highlight) return
+        // While a dialog owns focus the whole scroll-mode overlay is suspended
+        // (see applyFocusState): no bar, no selection, no poll.
+        if (!state.active || !options.highlight || focusState.foreign) return
         refreshBar()
         if (!barPos || !barRgba) return
         if (barPos.y < 0) return
@@ -1830,9 +1907,11 @@ export default Plugin.define({
 
     keymap.layer(() => {
       const active = state.active
+      const suspended = focusState.foreign
 
-      const commands: any[] = [
-        {
+      const commands: any[] = []
+      if (!suspended) {
+        commands.push({
           id: "scroll-mode.toggle",
           title: "Toggle scroll mode",
           group: "Scroll mode",
@@ -1858,10 +1937,10 @@ export default Plugin.define({
               toast(`Scroll mode: editor disabled · ctrl+u / ctrl+d scroll, ${options.toggleKey} back to edit`)
             }
           },
-        },
-      ]
+        })
+      }
 
-      if (active) {
+      if (active && !suspended) {
         // Half-page scrolling. The cursor keeps its screen row while the text
         // scrolls under it, in both normal and visual mode.
         commands.push(
@@ -2132,11 +2211,23 @@ export default Plugin.define({
         }
       }
 
+      // Wrap every command's run() so it re-reads live focus at execution time.
+      // If a dialog owns focus we return false (continue keyboard dispatch) so
+      // the key reaches the dialog untouched, and the scroll action never runs.
+      // This bypasses the layer's reactive suspension, which is unreliable.
+      const guarded = commands.map((c: any) => ({
+        ...c,
+        run: (...args: any[]) => {
+          if (dialogHasFocus()) return false
+          return c.run(...args)
+        },
+      }))
+
       return {
         mode: "global",
         priority: 100,
-        commands,
-        bindings: commands.map((c) => c.id),
+        commands: guarded,
+        bindings: guarded.map((c) => c.id),
       }
     })
 
@@ -2169,6 +2260,14 @@ export default Plugin.define({
             /* ignore */
           }
         }
+        renderer.on("focused_renderable", onFocusChange)
+        detachFocusGuard = () => {
+          try {
+            renderer.off("focused_renderable", onFocusChange)
+          } catch {
+            /* ignore */
+          }
+        }
       }
     } catch {
       /* ignore */
@@ -2184,6 +2283,7 @@ export default Plugin.define({
       clearTimeout(restoreIfActive)
       detachGuard?.()
       detachCursorGuard?.()
+      detachFocusGuard?.()
       try {
         renderer?.removePostProcessFn?.(drawCursorBar)
       } catch {
